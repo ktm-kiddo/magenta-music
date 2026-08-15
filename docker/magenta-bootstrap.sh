@@ -81,6 +81,22 @@ if [[ -n "${MUSIC_TOKEN:-}${CF_TUNNEL_TOKEN:-}${MUSIC_HOSTNAME:-}" ]]; then
   fi
 fi
 
+# --- Groq key --------------------------------------------------------------
+# .env is gitignored, so it never arrives with the clone -- which on a fresh
+# instance means the one remaining manual step. Taking the key from the template
+# environment removes it, and this is the only reason the file needs writing at
+# all: prompt_enhancer reads .env, not the environment.
+if [[ -n "${GROQ_API_KEY:-}" ]]; then
+  if [[ ! -f "$MUSIC_ROOT/.env" ]]; then
+    say "writing Groq key to $MUSIC_ROOT/.env"
+    install -m 600 /dev/null "$MUSIC_ROOT/.env"
+    echo "GROQ_API_KEY=$GROQ_API_KEY" >> "$MUSIC_ROOT/.env"
+  elif ! grep -q '^GROQ_API_KEY=' "$MUSIC_ROOT/.env"; then
+    say "adding Groq key to the existing $MUSIC_ROOT/.env"
+    echo "GROQ_API_KEY=$GROQ_API_KEY" >> "$MUSIC_ROOT/.env"
+  fi
+fi
+
 # --- Optional autostart ----------------------------------------------------
 # Off by default: a box that starts streaming the moment it boots is only
 # useful if Foundry already knows its address, which means a fixed token and a

@@ -74,6 +74,7 @@ is a published token.
 | `MUSIC_TOKEN` | generated per boot | Fix it and Foundry's token setting stops changing |
 | `CF_TUNNEL_TOKEN` | — | Named-tunnel token; fixes the hostname too |
 | `MUSIC_HOSTNAME` | — | The hostname routed to `localhost:30001`, e.g. `music.example.com` |
+| `GROQ_API_KEY` | — | Written to `.env` at boot; removes the last manual step |
 | `MUSIC_MODEL` | `mrt2_small` | Must be a model baked into the image |
 | `MUSIC_REPO` | this repo | Point it at a fork |
 | `MUSIC_PREROLL` | `6` | Seconds buffered before playback starts |
