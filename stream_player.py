@@ -1,4 +1,4 @@
-"""Interactive real-time streaming player for Magenta RT 2 (MLX).
+"""Interactive real-time streaming player for Magenta RT 2.
 
 Generates audio continuously in a worker thread, plays it through the default
 output device, and lets you retype the style prompt at any time -- the model
@@ -6,6 +6,9 @@ keeps its state, so the music morphs into the new prompt instead of restarting.
 Type nothing and it just keeps going on the current prompt.
 
     python stream_player.py --prompt "slow ominous dungeon drone, low strings"
+
+Runs on an Apple Silicon GPU through MLX by default; --backend jax runs the
+same model on CUDA, for hosting it on a rented GPU box (see the README).
 
 Defaults to mrt2_small, which generates ~2.9x faster than realtime on this
 machine and so keeps latency low; pass --model mrt2_base for higher quality at
@@ -36,9 +39,7 @@ import threading
 import time
 
 import numpy as np
-import sounddevice as sd
 
-from magenta_rt import MagentaRT2StdMlxfn
 from magenta_rt.config import MUSICCOCA
 
 import prompt_enhancer
@@ -46,6 +47,32 @@ import prompt_enhancer
 SAMPLE_RATE = 48_000
 FRAMES_PER_SECOND = 25  # one model frame is 40 ms of audio
 DEFAULT_PROMPT = 'slow ominous dungeon drone, low strings'
+
+
+def _sounddevice():
+  """Import sounddevice on demand.
+
+  A headless server (--no-local-audio) has no output device and often no
+  PortAudio library at all, so importing at module scope would make the box
+  unusable for the thing it is actually there to do.
+  """
+  import sounddevice as sd
+  return sd
+
+
+def _backend(name: str):
+  """Return the MagentaRT2 class for `name`.
+
+  Imported here rather than at module scope because each backend pulls in a
+  framework the other machine does not have: MLX is Apple-only, and the JAX
+  build wants CUDA.
+  """
+  import magenta_rt
+  if name == 'mlx':
+    return magenta_rt.MagentaRT2StdMlxfn
+  if name == 'jax':
+    return magenta_rt.MagentaRT2Jax
+  raise ValueError(f'unknown backend {name!r}')
 
 
 class VarispeedBuffer:
@@ -179,15 +206,49 @@ class StreamingPlayer:
         print(f'  -> morphing to "{style}" over {self.args.morph:.1f}s')
       return style, error
 
-  def _handle_remote_prompt(self, text: str, raw: bool,
-                            morph: float | None = None) -> tuple[str, str | None]:
-    """Called from an HTTP thread when someone types /music in Foundry."""
-    if morph is not None:
+  def _apply_tuning(self, tuning: dict) -> list[str]:
+    """Apply generation knobs sent by a remote client; return what changed.
+
+    Values are clamped rather than rejected: these arrive from a chat command
+    or a slider in someone else's browser, and a wild number should not be
+    able to make the generator unstable mid-session.
+    """
+    applied = []
+    for key, value in tuning.items():
       try:
-        self.args.morph = max(0.0, float(morph))
-        print(f'\n[foundry] cross-fade set to {self.args.morph:.1f}s')
+        if key == 'morph':
+          self.args.morph = min(30.0, max(0.0, float(value)))
+          applied.append(f'morph={self.args.morph:.1f}s')
+        elif key == 'temp':
+          with self._cond_lock:
+            self.temperature = min(4.0, max(0.05, float(value)))
+          applied.append(f'temp={self.temperature:.2f}')
+        elif key == 'topk':
+          with self._cond_lock:
+            self.top_k = min(1024, max(1, int(value)))
+          applied.append(f'topk={self.top_k}')
+        elif key == 'cfg':
+          with self._cond_lock:
+            self.cfg = min(10.0, max(0.0, float(value)))
+          applied.append(f'cfg={self.cfg:.1f}')
+        elif key == 'llm':
+          want = bool(value)
+          if want and self.enhancer is None:
+            applied.append('llm=off (no API key)')
+          else:
+            self.use_llm = want
+            applied.append(f'llm={"on" if want else "off"}')
       except (TypeError, ValueError):
-        pass
+        applied.append(f'{key}=? (ignored)')
+    return applied
+
+  def _handle_remote_prompt(self, text: str, raw: bool,
+                            tuning: dict | None = None) -> tuple[str, str | None]:
+    """Called from an HTTP thread when someone types /music in Foundry."""
+    if tuning:
+      applied = self._apply_tuning(tuning)
+      if applied:
+        print(f'\n[foundry] {", ".join(applied)}')
       if not text:
         print('> ', end='', flush=True)
         return self.prompt, None
@@ -236,7 +297,7 @@ class StreamingPlayer:
   def _generate_loop(self) -> None:
     try:
       t0 = time.time()
-      self.mrt = MagentaRT2StdMlxfn(size=self.args.model)
+      self.mrt = _backend(self.args.backend)(size=self.args.model)
       self._emb = self._embed(self.args.prompt)
       print(f'Loaded in {time.time() - t0:.1f}s', flush=True)
     except BaseException as e:  # surfaced by run()
@@ -298,6 +359,22 @@ class StreamingPlayer:
     total = sum(len(c) for c in self._recorded) / SAMPLE_RATE
     print(f'Wrote {total:.1f}s to {path} (48kHz stereo, unstretched)')
 
+  def _remote_status(self) -> dict:
+    """What GET /status returns: enough for a client to draw a full UI."""
+    return {
+        'prompt': self.prompt,
+        'model': self.args.model,
+        'llm': self.enhancer.model if self.use_llm else None,
+        'morph': round(self.args.morph, 2),
+        'temp': round(self.temperature, 3),
+        'topk': self.top_k,
+        'cfg': round(self.cfg, 2),
+        'buffer': round(self.buffer.available_seconds(), 2),
+        'speed': round(self.buffer.speed, 3),
+        'gen': round(self._rtf, 2),
+        'generated': round(self._generated_s, 1),
+    }
+
   def status(self) -> str:
     llm = 'off'
     if self.use_llm:
@@ -327,9 +404,7 @@ class StreamingPlayer:
       import music_server
       self.server = music_server.MusicServer(
           on_prompt=self._handle_remote_prompt,
-          status_fn=lambda: {'prompt': self.prompt,
-                             'model': self.args.model,
-                             'llm': self.enhancer.model if self.use_llm else None},
+          status_fn=self._remote_status,
           port=self.args.serve_port, bitrate=self.args.serve_bitrate,
           token=self.args.serve_token)
       self.server.start()
@@ -370,7 +445,7 @@ class StreamingPlayer:
       except (KeyboardInterrupt, EOFError):
         print()
     else:
-      stream = sd.OutputStream(
+      stream = _sounddevice().OutputStream(
           samplerate=SAMPLE_RATE, channels=2, dtype='float32',
           blocksize=1024, device=self.args.device,
           callback=self._audio_callback)
@@ -450,6 +525,10 @@ def main() -> None:
   p.add_argument('--model', default='mrt2_small',
                  help='mrt2_small (~2.9x realtime, low latency) or mrt2_base '
                       '(~0.93x realtime, better quality but needs varispeed)')
+  p.add_argument('--backend', default='mlx', choices=['mlx', 'jax'],
+                 help='mlx runs on an Apple Silicon GPU (the default); jax '
+                      'runs on CUDA, for hosting this on a rented GPU box. '
+                      'The two load different weights -- see the README.')
   p.add_argument('--chunk', type=int, default=5,
                  help='model frames per generate call (5 = 200ms). Smaller '
                       'reacts faster to prompts, larger is slightly cheaper.')
@@ -507,7 +586,7 @@ def main() -> None:
   args = p.parse_args()
 
   if args.list_devices:
-    print(sd.query_devices())
+    print(_sounddevice().query_devices())
     return
 
   # mrt2_base generates slower than realtime, so it needs a deeper buffer for

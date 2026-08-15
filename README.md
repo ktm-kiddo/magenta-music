@@ -126,8 +126,10 @@ tunnels — is in [foundry-module/README.md](foundry-module/README.md).
 
 ## Requirements
 
-- **Apple Silicon Mac.** The model runs through MLX on the GPU. There is no CPU
-  or CUDA path in this setup.
+- **Apple Silicon Mac**, or a Linux box with an NVIDIA GPU — see [Running the
+  model on a remote GPU](#running-the-model-on-a-remote-gpu). On the Mac the
+  model runs through MLX; on NVIDIA it runs the same model through JAX. There
+  is no CPU path.
 - **Python 3.12** (developed against 3.12.14)
 - `magenta-rt` 2.0.3, `mlx` + `mlx-metal`, `sounddevice`, `soundfile`,
   `lameenc`, `requests`, `numpy`
@@ -179,6 +181,7 @@ Pressing Enter on an empty line does nothing — the music just keeps going.
 | `--serve-token SECRET` | Require a shared secret — **mandatory on a public tunnel** |
 | `--prompt "..."` | Set the opening style or scene |
 | `--model mrt2_base` | Higher quality, slower (see below) |
+| `--backend jax` | Run on an NVIDIA GPU instead of Apple Silicon ([details](#running-the-model-on-a-remote-gpu)) |
 | `--serve-bitrate 96` | Lower MP3 bitrate if your upstream is tight |
 | `--no-llm` | Send your text straight to the music model, no rewriting |
 | `--list-devices` | List audio outputs, for `--device` |
@@ -296,6 +299,105 @@ path is browser → your Mac directly, and never touches Foundry's server. At th
 default 128 kbit/s that's ~16 KB/s each, so five players is roughly 0.6 Mbit/s
 of sustained upstream from your home connection. Drop `--serve-bitrate` to 96 or
 64 if that's tight.
+
+---
+
+## Running the model on a remote GPU
+
+Nothing here has to run on your laptop. With `--serve` the player is already a
+headless server — it streams MP3 over HTTP and takes prompts on `POST /prompt`
+— so putting it on a rented GPU box (RunPod, Lambda, Vast.ai, a cloud VM) means
+no Apple Silicon requirement, no music generation competing with Foundry for
+your laptop, and listener bandwidth coming out of a datacenter instead of your
+home upstream.
+
+The one Mac-specific piece is the model backend. `magenta-rt` ships a JAX
+implementation of the same model that runs on CUDA, and `--backend jax` selects
+it. Everything else — the buffer, the cross-fade, the MP3 fan-out, the LLM
+rewriter, the Foundry module — is unchanged.
+
+### Setting up the box
+
+Linux with an NVIDIA GPU and Python 3.12:
+
+```bash
+git clone https://github.com/ktm-kiddo/magenta-music.git
+cd magenta-music
+
+python3.12 -m venv .venv
+.venv/bin/pip install "magenta-rt[jax]" "jax[cuda12]" soundfile lameenc requests numpy
+```
+
+No `mlx`, and no `sounddevice` — a headless box has no output device, and the
+import is deferred so a missing PortAudio never comes up.
+
+**The weights are different files, and nothing fetches them for you.** MLX
+loads exported `.mlxfn` bundles; the JAX backend loads raw safetensors out of
+`~/Documents/Magenta/magenta-rt-v2/checkpoints/`. Pull those, plus the shared
+resources every backend needs (the MusicCoCa style encoder and SpectroStream):
+
+```bash
+.venv/bin/mrt models init                         # shared resources, ~1.3 GB
+.venv/bin/mrt checkpoints download mrt2_small     # ~1.1 GB (mrt2_base is 9.8 GB)
+```
+
+Then run it the way `start.sh` does, plus the backend flag:
+
+```bash
+.venv/bin/python stream_player.py --backend jax \
+  --serve --no-local-audio --serve-token "$(openssl rand -hex 16)"
+```
+
+Point *Module Settings → Music server URL* at the box and you're done.
+
+### What changes about the setup
+
+**Reaching it.** A cloud box with a public IP doesn't need cloudflared for
+NAT — but a hosted Foundry is HTTPS, and an HTTPS page still cannot load an
+HTTP stream, so you need TLS either way. Either terminate it in front of port
+30001 (Caddy will do this in one line with a domain), or keep using a tunnel
+exactly as on the Mac. `start.sh` works unmodified if you add `--backend jax`
+to the end: `MUSIC_TOKEN=… ./start.sh --backend jax`.
+
+**Set a token.** Non-negotiable here — the port is on the public internet by
+construction, not by accident.
+
+**Steering it.** Under `nohup` or systemd there is no console to type into. The
+`/music` chat command and the web page at `/` both work regardless; run it under
+`tmux` if you want the terminal prompt back.
+
+**Buffer defaults assume Mac speeds.** They're chosen from the model name —
+`mrt2_base` gets a deep 2 s buffer because it generates at ~0.93× realtime on
+an M-series GPU. A datacenter GPU should push `mrt2_base` past realtime, at
+which point that buffer is pure added latency. Watch `gen=` in `/status` and, if
+it's comfortably above 1.0×, pass `--target-buffer 0.8` to get the reaction time
+back.
+
+**Cost shape.** This is a process that holds the GPU for the whole session, not
+a burst of inference — you pay for wall-clock hours of play, and a small
+instance sized for `mrt2_small` is the economical pick.
+
+### Renting one per session
+
+Setup is the slow part, not the model: `jax[cuda12]` pulls in a couple of GB of
+CUDA wheels and the assets above are another ~2.4 GB, so a from-scratch box is
+several minutes of waiting before any music. Model load itself is seconds.
+
+So do that once, on storage that survives — a provider with a persistent volume
+(RunPod, Vast), or a cloud VM you *stop* rather than destroy. Then a session is:
+
+```bash
+# start the box, then:
+cd magenta-music
+MUSIC_TOKEN=$(openssl rand -hex 16) ./start.sh --backend jax
+# paste the printed URL + token into Foundry, play, Ctrl-C, stop the box
+```
+
+Stop the instance when you're done — an idle GPU bills exactly like a busy one.
+
+Not tested on CUDA hardware from here — the JAX backend is the one the upstream
+package ships for it, and the player's calls into it are the same two methods
+the MLX backend exposes, but the first run on a real GPU is still the first run.
 
 ---
 

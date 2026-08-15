@@ -9,8 +9,9 @@ cost 1.5 Mbit/s.
 Endpoints:
     GET  /             a test page with a player, for checking without Foundry
     GET  /stream.mp3   the endless stream; one connection per listener
-    GET  /status       JSON: current prompt, listener count
-    POST /prompt       JSON {"text": ..., "raw": false} -> steers the music
+    GET  /status       JSON: current prompt, listener count, tuning knobs
+    POST /prompt       JSON {"text": ..., "raw": false} -> steers the music,
+                       plus any of morph/temp/topk/cfg/llm to retune it
 
 Everything is CORS-open because the Foundry page is served from a different
 origin (and usually a different port) than this server.
@@ -138,13 +139,19 @@ setInterval(async()=>{
 """
 
 
+# Knobs a client may set through POST /prompt, alongside (or instead of) a
+# prompt. The player validates the values; the server only decides what is
+# spellable, so that a typo in a client cannot silently set something else.
+_TUNING_KEYS = ('morph', 'temp', 'topk', 'cfg', 'llm')
+
+
 class _Handler(http.server.BaseHTTPRequestHandler):
   # Close-delimited responses (shoutcast style) keep the endless stream simple:
   # no Content-Length, no chunked framing, the body just continues forever.
   protocol_version = 'HTTP/1.0'
 
   broadcaster: MP3Broadcaster = None
-  on_prompt = None       # callable(text, raw) -> (style, error)
+  on_prompt = None       # callable(text, raw, tuning) -> (style, error)
   status_fn = None       # callable() -> dict
   token = None           # shared secret, or None to allow anyone
 
@@ -245,13 +252,16 @@ class _Handler(http.server.BaseHTTPRequestHandler):
       return self._send_json({'ok': False, 'error': f'bad JSON: {e}'}, 400)
 
     text = (payload.get('text') or '').strip()
-    morph = payload.get('morph')
-    if not text and morph is None:
+    tuning = {k: payload[k] for k in _TUNING_KEYS
+              if k in payload and payload[k] is not None}
+    if not text and not tuning:
       return self._send_json({'ok': False, 'error': 'empty prompt'}, 400)
 
-    style, error = self.on_prompt(text, bool(payload.get('raw')), morph)
+    style, error = self.on_prompt(text, bool(payload.get('raw')), tuning)
+    # The caller almost always wants the new state right after changing it,
+    # and returning it here saves every client a follow-up GET /status.
     self._send_json({'ok': True, 'style': style, 'text': text,
-                     'warning': error})
+                     'warning': error, 'status': self.status_fn()})
 
 
 class MusicServer:
