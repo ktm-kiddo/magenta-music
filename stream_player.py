@@ -364,7 +364,11 @@ class StreamingPlayer:
     return {
         'prompt': self.prompt,
         'model': self.args.model,
+        'backend': self.args.backend,
         'llm': self.enhancer.model if self.use_llm else None,
+        # Clients show this so a silent stream can be told apart from a stream
+        # that is playing something the listener simply cannot hear.
+        'starved': round(self.buffer.starved_samples / SAMPLE_RATE, 2),
         'morph': round(self.args.morph, 2),
         'temp': round(self.temperature, 3),
         'topk': self.top_k,

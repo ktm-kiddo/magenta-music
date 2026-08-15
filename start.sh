@@ -18,7 +18,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 # One source of truth: the tunnel and the player must agree on the port, so
 # override it here rather than passing --serve-port through.
 PORT="${MUSIC_PORT:-30001}"
-log=$(mktemp -t magenta-tunnel)
+# The X's are required by GNU mktemp (Linux) and harmless on BSD (macOS) --
+# without them this script only runs on the Mac.
+log=$(mktemp -t magenta-tunnel.XXXXXX)
 tunnel_pid=""
 
 cleanup() {

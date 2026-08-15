@@ -19,6 +19,11 @@
  *   3. Routing a cross-origin stream through Web Audio requires CORS, and a
  *      proxy that strips those headers would silence the music -- so bus
  *      routing falls back to a plain element on the first sign of trouble.
+ *
+ * All three fail as silence, and so does a wrong URL, a wrong token, and a
+ * server that was never started. Silence is the same symptom for every one of
+ * them, so the failure paths here are deliberately verbose: see MusicError and
+ * diagnose(), which exist to turn "no music" into a specific thing to fix.
  */
 
 const MODULE_ID = "magenta-music";
@@ -37,10 +42,13 @@ let startedAt = 0;        // when the current connection began playing
 let status = null;        // last successful GET /status payload, else null
 let statusTimer = null;
 let inflight = null;      // de-duplicates concurrent status polls
+let lastError = null;     // MusicError currently worth showing the user
+let notifiedErrors = new Map();  // message -> timestamp, to not repeat ourselves
 
 /* Sidebar panel ----------------------------------------------------------- */
 let panel = null;
-let draft = { text: "", raw: false };  // survives sidebar re-renders
+let dragging = false;     // a slider is being dragged; don't redraw under it
+let draft = { text: "", raw: false, advanced: false };  // survives re-renders
 
 // Whatever the browser buffers before it starts playing becomes permanent
 // delay: from then on it receives and plays at the same rate, so the gap never
@@ -51,6 +59,9 @@ const LIVE_LAG_TARGET = 0.3;  // where we want to sit behind the live edge
 const LIVE_LAG_LIMIT = 1.0;   // above this, correct it
 
 const STATUS_POLL_MS = 6000;
+const REQUEST_TIMEOUT_MS = 6000;
+const NOTIFY_COOLDOWN_MS = 60000;
+
 const DEFAULT_PRESETS = [
   "Tavern | warm lute and fiddle, cheerful medieval tavern, light percussion",
   "Travel | gentle pastoral strings, rolling rhythm, hopeful woodwinds",
@@ -108,12 +119,461 @@ function shouldPlay() {
   return tablePlaying() && setting("enabled") && !!serverUrl();
 }
 
+/* ------------------------------------------------------------ diagnostics */
+
+/**
+ * An error that carries the fix, not just the symptom.
+ *
+ * Every failure in this module reaches the user as one of these, so that the
+ * message says which of the half-dozen indistinguishable causes of silence
+ * this one actually was.
+ */
+class MusicError extends Error {
+  /**
+   * @param {string} summary  One line: what went wrong.
+   * @param {string} [hint]   What to do about it. Shown beneath the summary.
+   * @param {object} [data]   Anything worth logging alongside it.
+   */
+  constructor(summary, hint = "", data = {}) {
+    super(summary);
+    this.name = "MusicError";
+    this.hint = hint;
+    this.data = data;
+  }
+
+  get full() {
+    return this.hint ? `${this.message} ${this.hint}` : this.message;
+  }
+}
+
+/** Parse the configured URL, or explain why it cannot be parsed. */
+function parseServerUrl() {
+  const raw = serverUrl();
+  if (!raw) {
+    throw new MusicError(
+      "No music server URL is configured.",
+      game.user.isGM
+        ? "Set it in Configure Settings → Module Settings → Music server URL. "
+          + "It is the address stream_player.py --serve prints on startup."
+        : "Ask your GM to set the music server URL in the module settings.");
+  }
+  try {
+    return new URL(raw);
+  } catch (err) {
+    throw new MusicError(
+      `"${raw}" is not a valid URL.`,
+      "It needs a scheme and a host, like http://192.168.1.10:30001 or "
+      + "https://your-tunnel.trycloudflare.com — no trailing path.");
+  }
+}
+
+/**
+ * Problems that make a request pointless: the browser will refuse it whatever
+ * the server does. Checked before every request, so the user gets the real
+ * reason instead of the opaque TypeError the browser would hand back.
+ */
+function fatalConfigurationProblem() {
+  let url;
+  try { url = parseServerUrl(); } catch (err) { return err; }
+
+  if (window.location.protocol === "https:" && url.protocol === "http:") {
+    return new MusicError(
+      "Foundry is served over HTTPS but the music server URL is plain HTTP.",
+      "The browser blocks this as mixed content and no audio can load. Put the "
+      + "music server behind HTTPS — a cloudflared tunnel or a reverse-proxy "
+      + "route — and use that address instead.",
+      { page: window.location.protocol, server: url.protocol });
+  }
+
+  if (url.pathname && url.pathname !== "/" && !setting("suppressPathWarning")) {
+    // Not a problem -- a reverse proxy route like /music is a supported setup
+    // -- but a stray path is a common paste error, so it is worth naming.
+    log(`note: server URL includes the path "${url.pathname}"; `
+      + "that is correct only if a reverse proxy serves the music server there");
+  }
+  return null;
+}
+
+/**
+ * Configuration that is *probably* the reason a request failed, checked only
+ * once one has. A loopback address is the example: it is wrong for almost
+ * everybody, but it is right for a GM whose browser and music server are on
+ * the same machine, so it may not pre-empt an attempt -- only explain a
+ * failure after the fact.
+ */
+function suspectConfiguration() {
+  const fatal = fatalConfigurationProblem();
+  if (fatal) return fatal;
+
+  let url;
+  try { url = parseServerUrl(); } catch (err) { return err; }
+
+  const loopback = ["localhost", "127.0.0.1", "[::1]", "::1"];
+  if (loopback.includes(url.hostname) && !loopback.includes(window.location.hostname)) {
+    return new MusicError(
+      `The music server URL points at ${url.hostname}, which for you means your own computer.`,
+      "It has to be an address your browser can reach across the network: the "
+      + "GM's LAN IP, or the tunnel hostname stream_player.py was started behind.",
+      { url: url.href });
+  }
+  return null;
+}
+
+/** Turn a rejected fetch into something actionable. */
+function describeFetchFailure(err, what) {
+  if (err instanceof MusicError) return err;
+
+  if (err?.name === "AbortError") {
+    return new MusicError(
+      `The music server did not answer within ${REQUEST_TIMEOUT_MS / 1000} seconds (${what}).`,
+      "It is reachable but not responding. The most common cause is that the "
+      + "model is still loading — that takes 10–30 seconds on a cold start. "
+      + "If it persists, check the terminal running stream_player.py.");
+  }
+
+  // A TypeError from fetch is the browser refusing to tell us why, so say what
+  // the possibilities are, with anything we already know promoted above them.
+  if (err instanceof TypeError) {
+    const suspect = suspectConfiguration();
+    if (suspect) { suspect.networkFailure = true; return suspect; }
+    const music = new MusicError(
+      `Could not reach the music server at ${serverUrl()} (${what}).`,
+      "Any of: stream_player.py is not running or was started without --serve; "
+      + "the URL or port is wrong; the tunnel has expired (a quick tunnel gets a "
+      + "new hostname every restart); or a proxy in front of it is stripping the "
+      + "CORS headers. Run /music diagnose for a breakdown.");
+    // Remembered so diagnose() knows to run the CORS-versus-unreachable probe;
+    // by then the original TypeError is long gone.
+    music.networkFailure = true;
+    return music;
+  }
+
+  return new MusicError(`Music server request failed (${what}): ${err?.message ?? err}`, "");
+}
+
+/** Turn an HTTP status into something actionable. */
+function describeHttpFailure(res, what) {
+  if (res.status === 403) {
+    return serverToken()
+      ? new MusicError(
+        "The music server rejected the token.",
+        "The value in Module Settings → Music server token has to match the "
+        + "--serve-token the player was started with, exactly. Both change if "
+        + "you regenerate the token, so re-paste it after every restart.")
+      : new MusicError(
+        "The music server requires a token and none is configured.",
+        "Copy the --serve-token value from the machine running stream_player.py "
+        + "into Module Settings → Music server token.");
+  }
+  if (res.status === 404) {
+    return new MusicError(
+      `The music server URL does not serve ${what} (404).`,
+      "The address is answering, but it is not the music server — or a "
+      + "reverse-proxy route is stripping the path. Open the URL directly in a "
+      + "browser tab: the music server shows a player and a prompt box.");
+  }
+  if (res.status >= 500) {
+    return new MusicError(
+      `The music server returned an error (${res.status}) for ${what}.`,
+      "Check the terminal running stream_player.py for a traceback.");
+  }
+  return new MusicError(
+    `The music server returned ${res.status} for ${what}.`, "");
+}
+
+/** Turn an <audio> element failure into something actionable. */
+function describeMediaError(element) {
+  const error = element?.error;
+  const codes = {
+    1: new MusicError("Audio playback was aborted.",
+      "Usually harmless — something interrupted the stream. It will reconnect."),
+    2: new MusicError("The connection to the music stream dropped.",
+      "The server went away mid-stream: stream_player.py stopped, the tunnel "
+      + "closed, or the network blipped. Reconnecting automatically."),
+    3: new MusicError("The browser could not decode the music stream.",
+      "The stream is arriving but is not valid MP3. Check that the URL points "
+      + "at the music server and not at something else on the same port."),
+    4: new MusicError("The browser refused the music stream source.",
+      "This is what a 403, a 404, a mixed-content block, or a missing CORS "
+      + "header all look like from an audio element. Run /music diagnose.")
+  };
+  const described = codes[error?.code];
+  if (described) {
+    described.data = { code: error.code, message: error.message };
+    return described;
+  }
+  return new MusicError("The music stream ended unexpectedly.",
+    "Reconnecting. If it keeps happening, check the terminal running "
+    + "stream_player.py.");
+}
+
+/**
+ * Record an error and, if it is new, tell the user once.
+ *
+ * Background failures repeat on every retry, so identical messages are muted
+ * for a minute; anything the user just asked for is always announced.
+ */
+function reportError(err, { notify = true, context = "" } = {}) {
+  const music = err instanceof MusicError
+    ? err
+    : new MusicError(err?.message ?? String(err), "");
+  lastError = music;
+  console.warn(`${MODULE_ID} |`, context || "error", music.full, music.data ?? "");
+
+  if (notify) {
+    const now = Date.now();
+    const seen = notifiedErrors.get(music.message);
+    if (!seen || (now - seen) > NOTIFY_COOLDOWN_MS) {
+      notifiedErrors.set(music.message, now);
+      ui.notifications?.error(`Live Music: ${music.full}`, { permanent: !!music.hint });
+    }
+  }
+  updatePanel();
+  return music;
+}
+
+function clearError() {
+  if (!lastError) return;
+  lastError = null;
+  notifiedErrors.clear();
+  updatePanel();
+}
+
+/**
+ * Walk every failure mode in order and report what each one says.
+ * This is what /music diagnose and the panel's Diagnose button run.
+ * @returns {Promise<Array<{level: string, title: string, detail: string}>>}
+ */
+async function diagnose() {
+  const checks = [];
+  const add = (level, title, detail = "") => checks.push({ level, title, detail });
+
+  // 1. Configuration, which no network test can disambiguate for us.
+  let url = null;
+  try {
+    url = parseServerUrl();
+    add("ok", "Server URL is set", url.href);
+  } catch (err) {
+    add("fail", err.message, err.hint);
+    return checks;  // nothing else can be tested without an address
+  }
+
+  const config = suspectConfiguration();
+  if (config) add("fail", config.message, config.hint);
+  else add("ok", "URL scheme is compatible with this page",
+    `Foundry is on ${window.location.protocol}//${window.location.host}`);
+
+  add(serverToken() ? "ok" : "info",
+    serverToken() ? "A token is configured" : "No token is configured",
+    serverToken()
+      ? "It must match --serve-token on the music server."
+      : "Fine on a LAN. On a public tunnel, anyone with the URL can take over "
+        + "the soundtrack — start the player with --serve-token.");
+
+  // 2. Can we talk to it at all, and is CORS the thing in the way? A no-cors
+  // request succeeds at the network layer even when the response is opaque, so
+  // the pair of results tells the two failures apart.
+  let reachable = false;
+  try {
+    const res = await request(`${serverUrl()}/status${tokenQuery()}`);
+    const data = await res.json();
+    reachable = true;
+    add("ok", "Music server is reachable",
+      `Playing "${data.prompt}" · ${data.listeners} listener(s) · `
+      + `model ${data.model} · generating at ${data.gen}× realtime`);
+    if (data.llm) add("ok", "Prompt rewriting is on", `Using ${data.llm}.`);
+    else add("info", "Prompt rewriting is off",
+      "Scene descriptions go to the music model unchanged, which embeds poorly. "
+      + "Set an API key in .env on the music server for better results.");
+    if (data.starved > 1) add("warn", `The generator has starved for ${data.starved}s`,
+      "Audio is dropping out at the source. Switch to mrt2_small or raise "
+      + "--target-buffer on the music server.");
+  } catch (err) {
+    const music = err instanceof MusicError ? err : describeFetchFailure(err, "GET /status");
+    add("fail", music.message, music.hint);
+
+    if (music.networkFailure) {
+      try {
+        await fetch(`${serverUrl()}/status${tokenQuery()}`, { mode: "no-cors" });
+        add("fail", "The server answered, but the browser blocked the response",
+          "That is a CORS failure: something between you and the music server is "
+          + "dropping its Access-Control-Allow-Origin header. If you use a "
+          + "reverse proxy, make sure it passes upstream headers through.");
+      } catch (err2) {
+        add("fail", "The server did not answer at the network layer",
+          "Nothing is listening on that address from where you are sitting. "
+          + "Confirm stream_player.py is running with --serve, and that the "
+          + "port or tunnel is open.");
+      }
+    }
+  }
+
+  // 3. The stream endpoint has its own auth path, and it is the one that
+  // matters -- /status can pass while /stream.mp3 is refused.
+  if (reachable) {
+    try {
+      const controller = new AbortController();
+      const res = await fetch(`${serverUrl()}/stream.mp3?t=${Date.now()}${tokenQuery("&")}`,
+        { signal: controller.signal });
+      controller.abort();  // headers are all we wanted; don't pull the stream
+      if (res.ok) add("ok", "The audio stream endpoint accepts this client");
+      else {
+        const music = describeHttpFailure(res, "/stream.mp3");
+        add("fail", music.message, music.hint);
+      }
+    } catch (err) {
+      if (err?.name !== "AbortError") {
+        add("warn", "Could not test the audio stream endpoint", err.message);
+      } else {
+        add("ok", "The audio stream endpoint accepts this client");
+      }
+    }
+  }
+
+  // 4. This client's own playback state.
+  if (!tablePlaying()) add("info", "The GM has stopped the music for the table",
+    "Press play in the Music sidebar tab, or type /music play.");
+  else if (!setting("enabled")) add("info", "You have muted the music for yourself",
+    "Type /music on, or press the headphones button in the Music tab.");
+  else if (armed) add("warn", "Playback is waiting for a click",
+    "Browsers block autoplay until you interact with the page. Click anywhere "
+    + "in the Foundry window.");
+  else if (audio && !audio.paused) {
+    add("ok", "Audio is playing",
+      `${liveLag().toFixed(1)}s behind the live edge, volume `
+      + `${Math.round(setting("volume") * 100)}% `
+      + (bus ? "· routed through Foundry's Music channel"
+             : "· played directly (the core Music slider is applied manually)"));
+  } else if (audio) add("warn", "The audio element exists but is not playing",
+    audio.error ? describeMediaError(audio).full : "It may still be buffering.");
+  else add("warn", "No audio element is connected", "Playback has not started.");
+
+  // 5. Volume, because a muted slider looks exactly like a broken stream.
+  const globalMusic = (() => {
+    try { return game.settings.get("core", "globalPlaylistVolume"); } catch (e) { return null; }
+  })();
+  if (setting("volume") === 0) add("fail", "Your Live Music volume is zero",
+    "Raise the slider in the Music sidebar tab.");
+  if (globalMusic === 0) add("fail", "Foundry's global Music volume is zero",
+    "Raise it in the Music sidebar tab under Volume Controls — it applies to "
+    + "the live stream as well as playlists.");
+
+  if (lastError) add("info", "Most recent error", lastError.full);
+  return checks;
+}
+
+/* --------------------------------------------------------------- requests */
+
+/** fetch with a timeout, token header, and HTTP errors turned into MusicErrors. */
+async function request(url, options = {}) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const headers = { ...(options.headers ?? {}) };
+  const token = serverToken();
+  if (token) headers["X-Music-Token"] = token;
+  try {
+    const res = await fetch(url, { ...options, headers, signal: controller.signal });
+    if (!res.ok) throw describeHttpFailure(res, options.what ?? url);
+    return res;
+  } catch (err) {
+    throw describeFetchFailure(err, options.what ?? "request");
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchStatus({ notify = false } = {}) {
+  const fatal = fatalConfigurationProblem();
+  if (fatal) {
+    status = null;
+    reportError(fatal, { notify: notify && game.user.isGM, context: "status poll" });
+    throw fatal;
+  }
+  if (inflight) return inflight;
+  inflight = request(`${serverUrl()}/status${tokenQuery()}`, { what: "GET /status" })
+    .then(res => res.json())
+    .then(data => { status = data; clearError(); return data; })
+    .catch(err => {
+      status = null;
+      const music = reportError(err, { notify, context: "status poll" });
+      throw music;
+    })
+    .finally(() => { inflight = null; updatePanel(); });
+  return inflight;
+}
+
+/**
+ * Send a prompt and/or tuning changes to the music server.
+ * @param {string} text                Scene description, or "" to only retune.
+ * @param {object} [options]
+ * @param {boolean} [options.raw]      Skip the LLM rewrite, use these words.
+ * @param {object} [options.tuning]    Any of morph/temp/topk/cfg/llm.
+ */
+async function sendPrompt(text, { raw = false, tuning = {} } = {}) {
+  // Refuse before the browser does, so the user gets the reason and not a
+  // bare "Failed to fetch".
+  const fatal = fatalConfigurationProblem();
+  if (fatal) throw fatal;
+  const res = await request(`${serverUrl()}/prompt`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, raw, ...tuning }),
+    what: "POST /prompt"
+  });
+  const data = await res.json();
+  if (data.ok === false) {
+    throw new MusicError(`The music server rejected that: ${data.error}`, "");
+  }
+  if (data.status) { status = data.status; clearError(); }
+  // The rewrite degrades to raw text rather than failing, so a warning here
+  // means the music did change -- just not the way it was asked to.
+  if (data.warning) {
+    ui.notifications?.warn(
+      `Live Music: the prompt rewriter failed (${data.warning}), so your words `
+      + "were sent to the music model unchanged.");
+  }
+  updatePanel();
+  return data;
+}
+
+/**
+ * The one path everything uses to change the music: chat command, sidebar
+ * prompt box, and preset buttons all land here.
+ */
+async function steer(text, { raw = false, announce = true } = {}) {
+  if (!canSteer()) {
+    throw new MusicError("You do not have permission to change the music.",
+      "The GM controls this under Module Settings → Who can change the music.");
+  }
+  const data = await sendPrompt(text, { raw });
+  if (announce && setting("announceInChat")) {
+    // Everyone should see why the music changed, so this one is public.
+    await ChatMessage.create({
+      content: `<p>🎵 <i>${esc(text)}</i><br><b>${esc(data.style ?? text)}</b></p>`,
+      speaker: { alias: "Music" }
+    });
+  }
+  // Everyone should be at the live edge for the change they just asked for.
+  game.socket.emit(SOCKET, { action: "sync" });
+  syncToLive();
+  return data;
+}
+
+async function retune(tuning) {
+  if (!canSteer()) {
+    throw new MusicError("You do not have permission to change the music.",
+      "The GM controls this under Module Settings → Who can change the music.");
+  }
+  return sendPrompt("", { tuning });
+}
+
+/* -------------------------------------------------------------- playback */
+
 /**
  * Volume in [0,1] for this client's own slider, curved the way Foundry curves
  * its own volume sliders so the two feel the same under the hand.
  */
-function ownVolume() {
-  const raw = setting("volume");
+function ownVolume(raw = setting("volume")) {
   const helper = foundry.audio?.AudioHelper ?? globalThis.AudioHelper;
   return helper?.inputToVolume ? helper.inputToVolume(raw) : raw;
 }
@@ -137,20 +597,6 @@ function applyVolume() {
   updatePanel();
 }
 
-function parsePresets() {
-  return (setting("presets") ?? "").split(/[\n;]+/)
-    .map(line => line.trim()).filter(Boolean)
-    .map(line => {
-      const [label, ...rest] = line.split("|");
-      const style = rest.join("|").trim();
-      // A bare line with no "|" is both its own label and its own style.
-      return { label: label.trim(), style: style || label.trim() };
-    })
-    .filter(p => p.label);
-}
-
-/* -------------------------------------------------------------- playback */
-
 /**
  * Route the stream through Foundry's Music bus, so the core Music volume
  * slider governs it exactly as it governs a playlist track.
@@ -173,7 +619,7 @@ function connectToMusicBus(element) {
     if (ctx.state === "suspended") ctx.resume();
     return true;
   } catch (err) {
-    log("could not route through the Music bus:", err.message);
+    log("could not route through the Music bus, playing directly:", err.message);
     busDisabled = true;
     return false;
   }
@@ -181,7 +627,8 @@ function connectToMusicBus(element) {
 
 function disconnectFromMusicBus() {
   if (!bus) return;
-  try { bus.source.disconnect(); bus.gain.disconnect(); } catch (err) { /* already gone */ }
+  try { bus.source.disconnect(); bus.gain.disconnect(); }
+  catch (err) { /* already torn down */ }
   bus = null;
 }
 
@@ -214,6 +661,8 @@ function stopPlayback() {
   if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
   disconnectFromMusicBus();
   if (audio) {
+    audio.removeEventListener("error", onStreamProblem);
+    audio.removeEventListener("ended", onStreamProblem);
     audio.pause();
     audio.removeAttribute("src");
     audio.load();
@@ -226,6 +675,13 @@ function stopPlayback() {
 function startPlayback({ restart = false } = {}) {
   if (!shouldPlay()) return;
   if (audio && !restart) return;
+
+  const problem = fatalConfigurationProblem();
+  if (problem) {
+    stopPlayback();
+    // Only the GM can fix any of these, so only the GM is interrupted by them.
+    return reportError(problem, { notify: game.user.isGM, context: "startPlayback" });
+  }
   stopPlayback();
 
   // Cache-buster: without it a reconnect can resume a dead cached response.
@@ -246,6 +702,7 @@ function startPlayback({ restart = false } = {}) {
   audio.play().then(() => {
     retryDelay = 1000;
     startedAt = Date.now();
+    clearError();
     log("playing", url, bus ? "(via the Music bus)" : "(direct)");
     // The initial buffer is built in the first couple of seconds; trim it once
     // it exists, then keep an eye on it in case a hiccup adds more.
@@ -254,9 +711,14 @@ function startPlayback({ restart = false } = {}) {
     syncTimer = setInterval(() => { if (setting("autoSync")) syncToLive(); }, 15000);
     updatePanel();
   }).catch((err) => {
-    // Almost always NotAllowedError: no user gesture yet.
-    log("autoplay blocked, waiting for a click:", err.name);
-    armForGesture();
+    if (err?.name === "NotAllowedError") {
+      log("autoplay blocked, waiting for a click");
+      return armForGesture();
+    }
+    reportError(new MusicError(
+      `The browser refused to start playback (${err?.name ?? "unknown error"}).`,
+      err?.message ?? "Run /music diagnose for a breakdown."),
+      { context: "audio.play()" });
   });
   updatePanel();
 }
@@ -274,10 +736,14 @@ function onStreamProblem() {
     return startPlayback({ restart: true });
   }
 
-  log(`stream dropped, retrying in ${retryDelay}ms`);
+  const music = describeMediaError(audio);
+  music.hint += ` Reconnecting in ${(retryDelay / 1000).toFixed(0)}s.`;
+  // The first drop of a session is worth a notification; the retries after it
+  // are the same fact repeated, and reportError's cooldown swallows those.
+  reportError(music, { context: "stream" });
+
   setTimeout(() => startPlayback({ restart: true }), retryDelay);
   retryDelay = Math.min(retryDelay * 2, 30000);
-  updatePanel();
 }
 
 function armForGesture() {
@@ -307,93 +773,33 @@ function refreshPlaybackState() {
  * which is also what they want when the GM has the music running.
  */
 async function setPlaying(playing, { table = game.user.isGM } = {}) {
-  if (table && game.user.isGM) {
-    await game.settings.set(MODULE_ID, "playback", playing ? "playing" : "stopped");
-    // A player who had muted themselves stays muted; this only lifts the
-    // table-wide stop.
-    return;
+  try {
+    if (table && game.user.isGM) {
+      return await game.settings.set(MODULE_ID, "playback", playing ? "playing" : "stopped");
+    }
+    if (playing && !tablePlaying()) {
+      throw new MusicError("The GM has stopped the music for the whole table.",
+        "You will hear it again when they start it.");
+    }
+    return await game.settings.set(MODULE_ID, "enabled", playing);
+  } catch (err) {
+    reportError(err, { context: "setPlaying" });
   }
-  await game.settings.set(MODULE_ID, "enabled", playing);
-}
-
-/* --------------------------------------------------------------- server */
-
-async function fetchStatus({ quiet = true } = {}) {
-  if (!serverUrl()) { status = null; updatePanel(); return null; }
-  if (inflight) return inflight;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 5000);
-  inflight = fetch(`${serverUrl()}/status${tokenQuery()}`, { signal: controller.signal })
-    .then(res => {
-      if (!res.ok) throw new Error(`server returned ${res.status}`);
-      return res.json();
-    })
-    .then(data => { status = data; return data; })
-    .catch(err => {
-      status = null;
-      if (!quiet) throw err;
-      return null;
-    })
-    .finally(() => { clearTimeout(timeout); inflight = null; updatePanel(); });
-  return inflight;
-}
-
-/**
- * Send a prompt and/or tuning changes to the music server.
- * @param {string} text                Scene description, or "" to only retune.
- * @param {object} [options]
- * @param {boolean} [options.raw]      Skip the LLM rewrite, use these words.
- * @param {object} [options.tuning]    Any of morph/temp/topk/cfg/llm.
- */
-async function sendPrompt(text, { raw = false, tuning = {} } = {}) {
-  if (!serverUrl()) throw new Error("no music server URL is configured");
-  const headers = { "Content-Type": "application/json" };
-  const token = serverToken();
-  if (token) headers["X-Music-Token"] = token;
-  const res = await fetch(`${serverUrl()}/prompt`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ text, raw, ...tuning })
-  });
-  if (res.status === 403) throw new Error("the server rejected the token");
-  if (!res.ok) throw new Error(`server returned ${res.status}`);
-  const data = await res.json();
-  if (data.status) { status = data.status; updatePanel(); }
-  return data;
-}
-
-/**
- * The one path everything uses to change the music: chat command, sidebar
- * prompt box, and preset buttons all land here.
- */
-async function steer(text, { raw = false, announce = true } = {}) {
-  if (!canSteer()) {
-    ui.notifications?.warn("You do not have permission to change the music.");
-    return null;
-  }
-  const data = await sendPrompt(text, { raw });
-  if (announce && setting("announceInChat")) {
-    // Everyone should see why the music changed, so this one is public.
-    await ChatMessage.create({
-      content: `<p>🎵 <i>${esc(text)}</i><br><b>${esc(data.style ?? text)}</b></p>`,
-      speaker: { alias: "Music" }
-    });
-  }
-  // Everyone should be at the live edge for the change they just asked for.
-  game.socket.emit(SOCKET, { action: "sync" });
-  syncToLive();
-  return data;
-}
-
-async function retune(tuning) {
-  if (!canSteer()) {
-    ui.notifications?.warn("You do not have permission to change the music.");
-    return null;
-  }
-  return sendPrompt("", { tuning });
 }
 
 /* -------------------------------------------------------- sidebar panel */
+
+function parsePresets() {
+  return (setting("presets") ?? "").split(/[\n;]+/)
+    .map(line => line.trim()).filter(Boolean)
+    .map(line => {
+      const [label, ...rest] = line.split("|");
+      const style = rest.join("|").trim();
+      // A bare line with no "|" is both its own label and its own style.
+      return { label: label.trim(), style: style || label.trim() };
+    })
+    .filter(p => p.label);
+}
 
 /** The Playlists tab is where a listener looks for a transport, so build one. */
 function panelHTML() {
@@ -403,7 +809,6 @@ function panelHTML() {
   const steerable = canSteer();
   const isGM = game.user.isGM;
   const muted = !setting("enabled");
-  const lag = liveLag();
 
   const stateLabel = !serverUrl() ? "unconfigured"
     : !connected ? "offline"
@@ -414,9 +819,19 @@ function panelHTML() {
 
   const meta = connected
     ? `${status.listeners ?? 0} listener${status.listeners === 1 ? "" : "s"}`
-      + (playing ? ` &middot; ${lag.toFixed(1)}s behind` : "")
-      + (status.llm ? "" : " &middot; no LLM")
+      + (playing ? ` &middot; ${liveLag().toFixed(1)}s behind` : "")
+      + (status.llm ? "" : " &middot; no rewriter")
     : "music server unreachable";
+
+  const error = lastError ? `
+    <div class="mm-error">
+      <i class="fa-solid fa-triangle-exclamation" inert></i>
+      <div class="mm-error-text">
+        <b>${esc(lastError.message)}</b>
+        ${lastError.hint ? `<span>${esc(lastError.hint)}</span>` : ""}
+      </div>
+      <button type="button" class="mm-diagnose" data-mm="diagnose">Diagnose</button>
+    </div>` : "";
 
   const presets = parsePresets().map((p, i) =>
     `<button type="button" class="mm-preset" data-mm="preset" data-index="${i}"
@@ -430,9 +845,12 @@ function panelHTML() {
         ${knobHTML("temp", "Temperature", status.temp, 0.1, 2.5, 0.05, "")}
         ${knobHTML("cfg", "Style strength", status.cfg, 0, 8, 0.25, "")}
       </div>
-      <div class="mm-diag">model ${esc(status.model)} &middot;
-        gen ${esc(status.gen)}&times; realtime &middot;
-        buffer ${esc(status.buffer)}s</div>
+      <div class="mm-diag">
+        ${esc(status.model)} on ${esc(status.backend ?? "mlx")} &middot;
+        ${esc(status.gen)}&times; realtime &middot;
+        buffer ${esc(status.buffer)}s
+        <button type="button" class="mm-diagnose" data-mm="diagnose">Diagnose</button>
+      </div>
     </details>` : "";
 
   return `
@@ -441,6 +859,8 @@ function panelHTML() {
     <strong>Live Music</strong>
     <span class="mm-state mm-state-${connected ? (playing ? "live" : "idle") : "off"}">${stateLabel}</span>
   </header>
+
+  ${error}
 
   <div class="mm-now" data-tooltip="${esc(style)}">
     <i class="fa-thin fa-music" inert></i>
@@ -484,31 +904,68 @@ function knobHTML(key, label, value, min, max, step, unit) {
   </label>`;
 }
 
+/**
+ * Redraw the panel in place, keeping whatever the user was doing.
+ *
+ * The panel redraws on every status poll, so it has to survive being rebuilt
+ * under an open text box: the caret position and the focused control are
+ * restored, and a slider mid-drag suppresses the redraw entirely.
+ */
 function updatePanel() {
   if (!panel?.isConnected) { panel = null; return; }
-  // Don't yank the prompt box out from under someone mid-sentence.
+  if (dragging) return;
+
   const active = panel.contains(document.activeElement) ? document.activeElement : null;
-  if (active?.classList.contains("mm-prompt")) {
-    draft.text = active.value;
-    return;  // redraw once they are done typing
-  }
-  if (active?.type === "range") return;
+  const key = active?.dataset?.mm
+    ? `[data-mm="${active.dataset.mm}"]${active.dataset.key ? `[data-key="${active.dataset.key}"]` : ""}`
+    : active?.className ? `.${active.className.split(/\s+/)[0]}` : null;
+  const caret = active?.selectionStart ?? null;
+  if (active?.classList.contains("mm-prompt")) draft.text = active.value;
+  draft.advanced = panel.querySelector(".mm-advanced")?.open ?? draft.advanced;
+
   panel.innerHTML = panelHTML();
+
+  if (!key) return;
+  const restored = panel.querySelector(key);
+  if (!restored) return;
+  restored.focus({ preventScroll: true });
+  if (caret !== null && restored.setSelectionRange) {
+    try { restored.setSelectionRange(caret, caret); } catch (err) { /* not a text input */ }
+  }
+}
+
+async function showDiagnostics() {
+  ui.notifications?.info("Running Live Music diagnostics…");
+  const checks = await diagnose();
+  const icons = {
+    ok: "✅", warn: "⚠️", fail: "❌", info: "ℹ️"
+  };
+  const rows = checks.map(c =>
+    `<li>${icons[c.level]} <b>${esc(c.title)}</b>` +
+    (c.detail ? `<br><span style="opacity:.8">${esc(c.detail)}</span>` : "") + `</li>`).join("");
+  const failures = checks.filter(c => c.level === "fail").length;
+  await postLocal(
+    `<p><b>Live Music diagnostics</b> — ` +
+    (failures ? `${failures} problem${failures === 1 ? "" : "s"} found` : "no problems found") +
+    `</p><ul style="margin:0;padding-left:1.2em;line-height:1.5">${rows}</ul>`);
+  console.table?.(checks);
+  return checks;
 }
 
 function onPanelClick(event) {
   const button = event.target.closest("[data-mm]");
-  if (!button) return;
+  if (!button || button.tagName === "INPUT") return;
   const action = button.dataset.mm;
+  const guard = (promise) => Promise.resolve(promise)
+    .catch(err => reportError(err, { context: action }));
 
   if (action === "toggle") {
     event.preventDefault();
-    const playing = !!audio && !audio.paused;
-    return setPlaying(!playing);
+    return guard(setPlaying(!(audio && !audio.paused)));
   }
   if (action === "mute") {
     event.preventDefault();
-    return game.settings.set(MODULE_ID, "enabled", !setting("enabled"));
+    return guard(game.settings.set(MODULE_ID, "enabled", !setting("enabled")));
   }
   if (action === "sync") {
     event.preventDefault();
@@ -520,11 +977,15 @@ function onPanelClick(event) {
     event.preventDefault();
     return submitDraft();
   }
+  if (action === "diagnose") {
+    event.preventDefault();
+    return guard(showDiagnostics());
+  }
   if (action === "preset") {
     event.preventDefault();
     const preset = parsePresets()[Number(button.dataset.index)];
     if (!preset) return;
-    return steer(preset.style, { raw: true }).catch(reportError);
+    return guard(steer(preset.style, { raw: true }));
   }
 }
 
@@ -534,21 +995,24 @@ function submitDraft() {
   if (!text) return;
   draft.text = "";
   if (input) input.value = "";
-  return steer(text, { raw: draft.raw }).catch(reportError);
-}
-
-function reportError(err) {
-  log(err);
-  ui.notifications?.error(`Music server: ${err.message}`);
+  return steer(text, { raw: draft.raw })
+    .catch(err => reportError(err, { context: "prompt" }));
 }
 
 function attachPanelListeners(element) {
   element.addEventListener("click", onPanelClick);
 
+  element.addEventListener("pointerdown", (event) => {
+    if (event.target.type === "range") dragging = true;
+  });
+  window.addEventListener("pointerup", () => { dragging = false; });
+
   element.addEventListener("change", (event) => {
     const target = event.target;
+    dragging = false;
     if (target.classList.contains("mm-volume")) {
-      return game.settings.set(MODULE_ID, "volume", Number(target.value));
+      return game.settings.set(MODULE_ID, "volume", Number(target.value))
+        .catch(err => reportError(err, { context: "volume" }));
     }
     if (target.dataset.mm === "raw") {
       draft.raw = target.checked;
@@ -556,7 +1020,8 @@ function attachPanelListeners(element) {
     }
     if (target.dataset.mm === "knob") {
       draft.advanced = true;
-      return retune({ [target.dataset.key]: Number(target.value) }).catch(reportError);
+      return retune({ [target.dataset.key]: Number(target.value) })
+        .catch(err => reportError(err, { context: `set ${target.dataset.key}` }));
     }
   });
 
@@ -588,26 +1053,32 @@ function attachPanelListeners(element) {
 /** Insert the transport into the Playlists ("Music") sidebar tab. */
 function injectPanel(root) {
   if (!root) return;
-  root.querySelectorAll(`.${MODULE_ID}-panel`).forEach(el => el.remove());
+  try {
+    root.querySelectorAll(`.${MODULE_ID}-panel`).forEach(el => el.remove());
 
-  const element = document.createElement("div");
-  element.classList.add(`${MODULE_ID}-panel`, "global-control");
-  element.innerHTML = panelHTML();
-  attachPanelListeners(element);
+    const element = document.createElement("div");
+    element.classList.add(`${MODULE_ID}-panel`, "global-control");
+    element.innerHTML = panelHTML();
+    attachPanelListeners(element);
 
-  // Sit directly above the global volume sliders when they exist, so the two
-  // read as one block of audio controls; otherwise just go first.
-  const anchor = root.querySelector(".global-volume") ?? root.querySelector(".directory-list");
-  if (anchor) anchor.parentElement.insertBefore(element, anchor);
-  else root.prepend(element);
+    // Sit directly above the global volume sliders when they exist, so the two
+    // read as one block of audio controls; otherwise just go first.
+    const anchor = root.querySelector(".global-volume") ?? root.querySelector(".directory-list");
+    if (anchor?.parentElement) anchor.parentElement.insertBefore(element, anchor);
+    else root.prepend(element);
 
-  panel = element;
-  ensureStatusPolling();
+    panel = element;
+    ensureStatusPolling();
+  } catch (err) {
+    // A sidebar that fails to render is worse than a missing panel, so this
+    // never propagates into Foundry's render pipeline.
+    console.error(`${MODULE_ID} | could not render the Music tab panel`, err);
+  }
 }
 
 function ensureStatusPolling() {
   if (statusTimer) return;
-  fetchStatus();
+  fetchStatus().catch(() => { /* already reported and drawn */ });
   statusTimer = setInterval(() => {
     // Polling exists to keep the panel truthful; stop when nobody can see it.
     if (!panel?.isConnected) {
@@ -615,7 +1086,7 @@ function ensureStatusPolling() {
       statusTimer = null;
       return;
     }
-    fetchStatus();
+    fetchStatus().catch(() => { /* already reported and drawn */ });
   }, STATUS_POLL_MS);
 }
 
@@ -625,14 +1096,49 @@ const COMMAND_HELP =
   `<p><b>/music &lt;what is happening&gt;</b> — adapt the soundtrack.<br>` +
   `<b>/music raw &lt;style&gt;</b> — skip the AI rewrite.<br>` +
   `<b>/music status</b> — what is playing.<br>` +
+  `<b>/music diagnose</b> — check every reason it might not be working.<br>` +
   `<b>/music play</b> / <b>pause</b> — for the table if you are the GM, else for you.<br>` +
   `<b>/music on</b> / <b>off</b> — your own playback only.<br>` +
   `<b>/music sync</b> — jump to the live edge.<br>` +
   `<b>/music volume 0.4</b> — your own volume.<br>` +
   `<b>/music morph 3</b> — cross-fade seconds.<br>` +
-  `<b>/music temp 1.2</b> / <b>cfg 3</b> — generation knobs.<br>` +
+  `<b>/music temp 1.2</b> / <b>cfg 3</b> / <b>topk 40</b> — generation knobs.<br>` +
   `<b>/music llm on|off</b> — prompt rewriting.<br>` +
   `<b>/music presets</b> — list the configured presets.</p>`;
+
+const COMMANDS = ["help", "status", "diagnose", "play", "pause", "stop", "resume",
+  "on", "off", "sync", "presets", "volume", "morph", "temp", "topk", "cfg", "llm", "raw"];
+
+const KNOB_EXAMPLES = { morph: "3", temp: "1.2", topk: "40", cfg: "3" };
+
+/**
+ * Is `word` one edit away from `command` -- one insertion, deletion,
+ * substitution, or a swap of two neighbours?
+ *
+ * Deliberately strict. At two edits "synth" starts looking like "sync" and a
+ * legitimate one-word scene description gets refused, which is a worse failure
+ * than letting a genuine typo through to the music model.
+ */
+function isOneEditApart(word, command) {
+  if (word === command) return false;
+  const [a, b] = word.length >= command.length ? [word, command] : [command, word];
+  if (a.length - b.length > 1) return false;
+
+  let i = 0;
+  while (i < b.length && a[i] === b[i]) i++;
+  let j = 0;
+  while (j < b.length - i && a[a.length - 1 - j] === b[b.length - 1 - j]) j++;
+
+  // Same length: one substitution leaves nothing between the matching ends,
+  // and one transposition leaves exactly the two swapped characters.
+  if (a.length === b.length) {
+    const middle = a.length - i - j;
+    if (middle <= 1) return true;
+    return middle === 2 && a[i] === b[i + 1] && a[i + 1] === b[i];
+  }
+  // Different lengths: one insertion, so the ends must meet after skipping it.
+  return i + j >= b.length;
+}
 
 async function handleMusicCommand(argument) {
   const arg = (argument ?? "").trim();
@@ -644,59 +1150,101 @@ async function handleMusicCommand(argument) {
     if (arg === "on") return game.settings.set(MODULE_ID, "enabled", true);
     if (arg === "pause" || arg === "stop") return setPlaying(false);
     if (arg === "play" || arg === "resume") return setPlaying(true);
+    if (arg === "diagnose" || arg === "debug") return showDiagnostics();
 
     if (arg === "sync") {
+      if (!audio || audio.paused) {
+        throw new MusicError("Nothing is playing for you right now.",
+          "Type /music play first, or run /music diagnose.");
+      }
       const lag = syncToLive({ force: true });
       return postLocal(`<p>Skipped ${lag.toFixed(1)}s of buffered delay.</p>`);
     }
 
     if (arg === "presets") {
       const presets = parsePresets();
-      if (!presets.length) return postLocal(`<p>No presets are configured.</p>`);
+      if (!presets.length) {
+        throw new MusicError("No presets are configured.",
+          "The GM can add them in Module Settings → Preset buttons, one per "
+          + "line as \"Label | style prompt\".");
+      }
       return postLocal(`<p>${presets.map(p =>
         `<b>${esc(p.label)}</b> — ${esc(p.style)}`).join("<br>")}</p>`);
     }
 
     if (arg === "status") {
-      const data = await fetchStatus({ quiet: false });
+      const data = await fetchStatus();
       return postLocal(
         `<p>🎵 <b>${esc(data.prompt)}</b><br><i>${data.listeners} listener(s), ` +
         `model ${esc(data.model)}, rewriter ${esc(data.llm ?? "off")}, ` +
-        `cross-fade ${esc(data.morph)}s, your delay ${liveLag().toFixed(1)}s</i></p>`);
+        `cross-fade ${esc(data.morph)}s, generating at ${esc(data.gen)}× realtime, ` +
+        `your delay ${liveLag().toFixed(1)}s</i></p>`);
     }
 
-    const volume = arg.match(/^vol(?:ume)?\s+([\d.]+)$/i);
+    // Subcommands are matched on the keyword alone and validate their own
+    // argument. Folding the argument into the pattern would make "/music
+    // volume loud" fall through and be sung at the table instead of refused.
+    const volume = arg.match(/^vol(?:ume)?\b\s*(.*)$/i);
     if (volume) {
-      const value = Math.max(0, Math.min(1, Number(volume[1])));
+      const value = Number(volume[1]);
+      if (!volume[1] || !Number.isFinite(value) || value < 0 || value > 1) {
+        throw new MusicError(`"${volume[1] || "(nothing)"}" is not a volume.`,
+          "Give a number between 0 and 1, like /music volume 0.4.");
+      }
       await game.settings.set(MODULE_ID, "volume", value);
       return postLocal(`<p>Your music volume is now ${Math.round(value * 100)}%.</p>`);
     }
 
     // The tuning knobs all take one number and read back the same way.
-    const knob = arg.match(/^(morph|temp|topk|cfg)\s+([\d.]+)$/i);
+    const knob = arg.match(/^(morph|temp|topk|cfg)\b\s*(.*)$/i);
     if (knob) {
-      const data = await retune({ [knob[1].toLowerCase()]: Number(knob[2]) });
-      if (!data) return;
-      return postLocal(`<p>${esc(knob[1])} is now ` +
-        `${esc(data.status?.[knob[1].toLowerCase()] ?? knob[2])}.</p>`);
+      const key = knob[1].toLowerCase();
+      const value = Number(knob[2]);
+      if (!knob[2] || !Number.isFinite(value)) {
+        throw new MusicError(`"${knob[2] || "(nothing)"}" is not a number.`,
+          `${key} takes one number — try /music ${key} ${KNOB_EXAMPLES[key]}.`);
+      }
+      const data = await retune({ [key]: value });
+      return postLocal(`<p>${esc(key)} is now ${esc(data.status?.[key] ?? value)}.</p>`);
     }
 
-    const llm = arg.match(/^llm\s+(on|off)$/i);
+    const llm = arg.match(/^llm\b\s*(.*)$/i);
     if (llm) {
-      const data = await retune({ llm: llm[1].toLowerCase() === "on" });
-      if (!data) return;
+      const word = llm[1].toLowerCase();
+      if (word !== "on" && word !== "off") {
+        throw new MusicError(`"${llm[1] || "(nothing)"}" is not on or off.`,
+          "Use /music llm on or /music llm off.");
+      }
+      const data = await retune({ llm: word === "on" });
       return postLocal(`<p>Prompt rewriting is ` +
-        `${data.status?.llm ? `on (${esc(data.status.llm)})` : "off"}.</p>`);
+        (data.status?.llm ? `on (${esc(data.status.llm)}).` :
+          `off.${word === "on"
+            ? " The music server has no LLM API key configured — put one in "
+              + "its .env file and restart it." : ""}`) + `</p>`);
     }
 
-    const raw = /^raw\s+/i.test(arg);
-    const text = raw ? arg.replace(/^raw\s+/i, "").trim() : arg;
-    if (!text) return;
+    // A single word that is one typo away from a command is almost certainly
+    // that command: "/music stauts" should not morph the soundtrack into
+    // whatever "stauts" happens to embed as.
+    const nearMiss = !/\s/.test(arg) && COMMANDS.find(c => isOneEditApart(arg.toLowerCase(), c));
+    if (nearMiss) {
+      throw new MusicError(`"${arg}" is not a /music command. Did you mean /music ${nearMiss}?`,
+        `Type /music help for the list. To use "${arg}" as a music style `
+        + `anyway, type /music raw ${arg}.`);
+    }
+
+    const raw = /^raw\b/i.test(arg);
+    const text = raw ? arg.replace(/^raw\b\s*/i, "").trim() : arg;
+    if (!text) {
+      throw new MusicError("/music raw needs a style after it.",
+        "For example: /music raw dark ambient, low strings.");
+    }
     await steer(text, { raw });
   } catch (err) {
-    log(err);
-    postLocal(`<p>Music server unreachable (${esc(err.message)}). ` +
-      `Check the URL in module settings: <code>${esc(serverUrl() || "(not set)")}</code></p>`);
+    const music = reportError(err, { notify: false, context: "chat command" });
+    postLocal(`<p><b>${esc(music.message)}</b>` +
+      (music.hint ? `<br><span style="opacity:.85">${esc(music.hint)}</span>` : "") +
+      `</p>`);
   }
 }
 
@@ -715,7 +1263,7 @@ function postLocal(content) {
  * HTML -- "/music they enter the dungeon" arrives as
  * "<p>/music they enter the dungeon</p>". Matching the raw string against a
  * /^\/music/ pattern therefore never fires, and the command falls through to
- * Foundry's "invalid command" error.
+ * Foundry's "invalid command" error. This is the fix for that.
  */
 function plainText(message) {
   const template = document.createElement("template");
@@ -738,7 +1286,12 @@ Hooks.once("init", () => {
     config: true,
     type: String,
     default: `${window.location.protocol}//${window.location.hostname}:30001`,
-    onChange: () => { busDisabled = false; fetchStatus(); refreshPlaybackState(); }
+    onChange: () => {
+      busDisabled = false;
+      notifiedErrors.clear();
+      refreshPlaybackState();
+      fetchStatus({ notify: true }).catch(() => { /* reported */ });
+    }
   });
 
   game.settings.register(MODULE_ID, "serverToken", {
@@ -750,7 +1303,11 @@ Hooks.once("init", () => {
     config: true,
     type: String,
     default: "",
-    onChange: () => { fetchStatus(); refreshPlaybackState(); }
+    onChange: () => {
+      notifiedErrors.clear();
+      refreshPlaybackState();
+      fetchStatus({ notify: true }).catch(() => { /* reported */ });
+    }
   });
 
   game.settings.register(MODULE_ID, "steerPermission", {
@@ -842,6 +1399,13 @@ Hooks.once("init", () => {
     default: true
   });
 
+  game.settings.register(MODULE_ID, "suppressPathWarning", {
+    scope: "client",
+    config: false,
+    type: Boolean,
+    default: false
+  });
+
   // Foundry v14 parses chat commands from a registry. Registering here means
   // /music is a real command rather than something intercepted after the fact.
   const ChatLog = foundry.applications?.sidebar?.tabs?.ChatLog;
@@ -865,7 +1429,10 @@ Hooks.once("ready", () => {
   });
 
   refreshPlaybackState();
-  fetchStatus();
+  // One deliberate check on load, so a session that is going to be silent says
+  // why now rather than when someone first tries to use it. Players are only
+  // told about things they can act on; the rest is the GM's to fix.
+  fetchStatus({ notify: game.user.isGM }).catch(() => { /* reported */ });
   log("ready; streaming from", serverUrl() || "(no URL configured)");
 });
 
@@ -874,7 +1441,8 @@ Hooks.on("globalPlaylistVolumeChanged", () => { if (!bus) applyVolume(); });
 
 // The Playlists tab is the "music" tab, so the transport belongs there.
 Hooks.on("renderPlaylistDirectory", (app, element) => {
-  injectPanel(element instanceof HTMLElement ? element : element?.[0]);
+  // v13+ hands over an HTMLElement; v12 hands over a jQuery wrapper.
+  injectPanel(element?.jquery ? element[0] : element);
 });
 
 // Pre-v14 Foundry has no command registry; intercept the message instead.

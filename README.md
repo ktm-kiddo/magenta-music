@@ -395,6 +395,88 @@ MUSIC_TOKEN=$(openssl rand -hex 16) ./start.sh --backend jax
 
 Stop the instance when you're done — an idle GPU bills exactly like a busy one.
 
+### On Vast.ai specifically
+
+Vast is a good fit — this is a small model, so its cheap consumer cards (a 3090
+or 4090 is plenty for `mrt2_small`) are exactly the right tier. Four things are
+Vast-specific:
+
+**Rent on-demand, not interruptible.** A spot bid that gets outbid mid-session
+takes the music down in the middle of the game. The saving is not worth it.
+
+**Keep the tunnel — don't chase an open port.** Vast containers are usually
+behind NAT, and direct ports mean filtering for machines that support them and
+declaring `-p 30001:30001` at creation time. Even when you get one it's plain
+HTTP, which a hosted HTTPS Foundry refuses to load. `cloudflared` solves NAT and
+TLS together, so the Vast workflow is identical to the Mac one. Install it in
+the container:
+
+```bash
+curl -fsSL -o /usr/local/bin/cloudflared \
+  https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+chmod +x /usr/local/bin/cloudflared
+```
+
+**Pick a template with Python 3.12.** `magenta-rt` itself only wants 3.11, but
+`jax` 0.11 requires 3.12, and jax is what makes the GPU go. Ubuntu 24.04 images
+ship 3.12 as `python3`. You do *not* need a CUDA devel image — `jax[cuda12]`
+brings the CUDA runtime along as pip wheels, so all the host has to provide is a
+recent NVIDIA driver (any 12.x-capable one, 535+).
+
+**Point the assets at your persistent volume.** They default to
+`~/Documents/Magenta`, which on a container is `/root/Documents` — easy to lose
+and not where Vast's disk conventionally lives. Set `MAGENTA_HOME` once, in
+`~/.bashrc` so every session and every `mrt` command agrees:
+
+```bash
+echo 'export MAGENTA_HOME=/workspace/magenta' >> ~/.bashrc && source ~/.bashrc
+```
+
+Stop (don't destroy) the instance between sessions: you keep paying a few cents
+a month for the disk instead of re-downloading ~2.4 GB of assets and several GB
+of CUDA wheels every time you play.
+
+### Making a Vast template
+
+[vast-setup.sh](vast-setup.sh) does all of the above in one idempotent pass —
+packages, cloudflared, the repo, the venv, the model assets, `MAGENTA_HOME`.
+Every step is guarded, so re-running it on a provisioned box is a no-op. That
+matters because Vast runs a template's on-start script on *every* boot, not just
+the first.
+
+Vast's UI moves around, but a template is the same handful of fields whatever
+they're called this month:
+
+| Field | Value |
+|---|---|
+| Docker image | `nvidia/cuda:12.4.1-runtime-ubuntu24.04` (24.04 for Python 3.12; `runtime`, not `devel`) |
+| Launch mode | SSH — you want a shell for `tmux` and the player console |
+| Disk space | 40 GB (≈6 GB CUDA wheels + 2.4 GB assets, plus room for `mrt2_base` later) |
+| Environment | `MAGENTA_HOME=/workspace/magenta`, and `GROQ_API_KEY=…` if you want prompt rewriting |
+| On-start script | the two lines below |
+| Ports | none — the tunnel is outbound, so nothing needs opening |
+
+On-start script:
+
+```bash
+curl -fsSL -o /tmp/vast-setup.sh \
+  https://raw.githubusercontent.com/ktm-kiddo/magenta-music/main/vast-setup.sh
+bash /tmp/vast-setup.sh
+```
+
+Provisioning takes several minutes on a fresh instance and its output goes to
+`/var/log/onstart.log`, so the first boot looks idle for a while — `tail -f` it
+rather than guessing. If you'd rather watch it directly, leave the on-start
+field empty and run the same two lines by hand over SSH the first time; the
+template is still worth having for the image, disk, and env vars.
+
+Then every session is:
+
+```bash
+cd /workspace/magenta-music
+MUSIC_TOKEN=$(openssl rand -hex 16) ./start.sh --backend jax
+```
+
 Not tested on CUDA hardware from here — the JAX backend is the one the upstream
 package ships for it, and the player's calls into it are the same two methods
 the MLX backend exposes, but the first run on a real GPU is still the first run.
@@ -482,6 +564,7 @@ brief glitch beats drifting minutes behind the table.
 | File | What it is |
 |---|---|
 | [start.sh](start.sh) | Server + Cloudflare tunnel in one command, prints the URL |
+| [vast-setup.sh](vast-setup.sh) | Provisions a Vast.ai GPU box; idempotent, for the on-start hook |
 | [stream_player.py](stream_player.py) | Main entry point — generation loop, buffer, console |
 | [music_server.py](music_server.py) | HTTP server: MP3 broadcast, `/prompt`, `/status` |
 | [prompt_enhancer.py](prompt_enhancer.py) | Scene text → music style, via an LLM |
