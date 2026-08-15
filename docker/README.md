@@ -8,7 +8,19 @@ The repo itself is **not** baked in. `magenta-bootstrap` clones or pulls it at
 boot, so a code change costs a `git pull`, not a rebuild and a 10 GB push. Only
 a dependency change or a different baked model needs a new image.
 
-## Build it
+## Build it in CI (recommended)
+
+[`.github/workflows/image.yml`](../.github/workflows/image.yml) builds it on a
+GitHub runner and pushes to GHCR. Runners are x86, so nothing is emulated, and
+the 10–15 GB upload happens on a datacenter connection instead of yours.
+
+Actions tab → **template image** → **Run workflow**, choosing the model and tag.
+Or push a tag: `git tag image-v1 && git push origin image-v1`.
+
+Then make the package public under the repo's Packages tab — a Vast instance
+cannot pull a private image without registry credentials.
+
+## Build it locally
 
 The image must be `linux/amd64`, whatever you build it on.
 
