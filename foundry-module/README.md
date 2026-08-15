@@ -21,20 +21,27 @@ table of five needs roughly 0.6 Mbit/s of upstream.
 
 ## 1. Install the module
 
-Copy the module folder into your Foundry data directory:
+**By manifest URL (easiest, and the only option on hosted Foundry).** In
+*Add-on Modules → Install Module → Manifest URL*, paste:
+
+```
+https://raw.githubusercontent.com/OWNER/REPO/main/foundry-module/magenta-music/module.json
+```
+
+**Or copy the folder in,** if Foundry runs on a machine you control:
 
 ```bash
-cp -r "/Users/mateograif/music ai/foundry-module/magenta-music" \
-      "<FOUNDRY_DATA>/Data/modules/"
+cp -r foundry-module/magenta-music "<FOUNDRY_DATA>/Data/modules/"
 ```
 
 `<FOUNDRY_DATA>` is the path shown in Foundry under **Configuration → Data
-Path**. Then enable **Magenta Live Music** in *Manage Modules*.
+Path**. Either way, enable **Magenta Live Music** in *Manage Modules*.
 
 ## 2. Start the music
 
+From your checkout of this repo:
+
 ```bash
-cd "/Users/mateograif/music ai"
 .venv/bin/python stream_player.py --serve
 ```
 
@@ -120,17 +127,19 @@ token is set.
 
 - **VPS / self-hosted:** copy the folder into `Data/modules/` as above, over
   scp or the host's file manager.
-- **The Forge:** you cannot drop files into `Data/modules`. Publish the module
-  and install it by manifest URL — put `magenta-music/` in a public GitHub repo,
-  attach a zip of the folder to a release, then add these two fields to
-  `module.json` so Foundry can fetch it:
+- **The Forge:** you cannot drop files into `Data/modules`, so use the manifest
+  URL from step 1 — that is exactly what it is there for.
 
-  ```json
-  "manifest": "https://raw.githubusercontent.com/<you>/<repo>/main/module.json",
-  "download": "https://github.com/<you>/<repo>/releases/download/v1.0.0/magenta-music.zip"
-  ```
+To cut a new release after changing the module, bump `version` in `module.json`,
+then:
 
-  Then *Add-on Modules → Install Module → Manifest URL*.
+```bash
+./foundry-module/build-release.sh
+gh release create v1.0.1 dist/magenta-music.zip
+```
+
+The zip must have `module.json` at its root, not nested in a folder; the script
+handles that.
 
 ### Bandwidth moves to your uplink
 

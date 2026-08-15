@@ -1,7 +1,7 @@
 # Magenta Live Music
 
 A real-time AI soundtrack for tabletop games. The music never stops and never
-loops — it is generated continuously on this Mac. You type what is happening
+loops — it is generated continuously on your own machine. You type what is happening
 ("they enter the dungeon"), a small LLM rewrites that into a musical style, and
 the score **morphs** into it over a couple of seconds without restarting.
 
@@ -15,8 +15,16 @@ Two ways to use it:
 
 ## Quick start
 
+Requires an Apple Silicon Mac and Python 3.12 — see [Requirements](#requirements).
+
 ```bash
-cd "/Users/mateograif/music ai"
+git clone https://github.com/OWNER/REPO.git magenta-live-music
+cd magenta-live-music
+
+python3.12 -m venv .venv
+.venv/bin/pip install magenta-rt mlx mlx-metal sounddevice soundfile lameenc requests
+
+cp .env.example .env       # then put your Groq API key in it
 .venv/bin/python stream_player.py
 ```
 
@@ -47,7 +55,7 @@ Then open <http://localhost:30001/> in a browser to confirm it works before
 involving Foundry. That page has a player and a prompt box — if you hear music
 there, the server half is working.
 
-`--no-local-audio` stops this Mac's speakers. Use it whenever *you* are also
+`--no-local-audio` stops your Mac's speakers. Use it whenever *you* are also
 listening through Foundry, otherwise you hear the same music twice, offset by
 the stream delay.
 
@@ -58,15 +66,13 @@ tunnels — is in [foundry-module/README.md](foundry-module/README.md).
 
 ## Requirements
 
-Already installed in `.venv`, listed here for rebuilding:
-
 - **Apple Silicon Mac.** The model runs through MLX on the GPU. There is no CPU
   or CUDA path in this setup.
-- **Python 3.12** (`.venv` is 3.12.14)
+- **Python 3.12** (developed against 3.12.14)
 - `magenta-rt` 2.0.3, `mlx` + `mlx-metal`, `sounddevice`, `soundfile`,
   `lameenc`, `requests`, `numpy`
-
-To recreate the environment from scratch:
+- An API key for any OpenAI-compatible chat endpoint, for the prompt rewriter.
+  Optional — without one, your text goes to the music model unchanged.
 
 ```bash
 python3.12 -m venv .venv
@@ -76,8 +82,9 @@ python3.12 -m venv .venv
 Model weights download automatically on first run and are cached by
 `huggingface_hub` — the first launch is slow, later ones are not.
 
-Always invoke `.venv/bin/python` directly rather than activating the venv. The
-directory name has a space in it, which trips up some `activate` scripts.
+The examples invoke `.venv/bin/python` directly rather than activating the venv.
+Activating works too, but if your checkout path contains a space, some
+`activate` scripts mishandle it — calling the interpreter by path always works.
 
 ---
 
@@ -108,7 +115,7 @@ Pressing Enter on an empty line does nothing — the music just keeps going.
 | Flag | Why you'd use it |
 |---|---|
 | `--serve` | Stream over HTTP so Foundry players can listen (port 30001) |
-| `--no-local-audio` | Don't use this Mac's speakers |
+| `--no-local-audio` | Don't use your Mac's speakers |
 | `--serve-token SECRET` | Require a shared secret — **mandatory on a public tunnel** |
 | `--prompt "..."` | Set the opening style or scene |
 | `--model mrt2_base` | Higher quality, slower (see below) |
@@ -155,24 +162,24 @@ Everything degrades gracefully: no key, a network error, or a rate limit all
 fall back to sending your text to the music model unchanged. You'll see a
 warning line, and the music keeps playing.
 
-### ⚠ The API key needs fixing
+### Setting the API key
 
-Two problems with how the key is currently wired up:
+Copy `.env.example` to `.env` and put your key in it:
 
-1. **The Groq key is hardcoded in plaintext** at `prompt_enhancer.py:22`. This
-   directory is a git repo — a single `git add .` commits a live credential to
-   history. **Rotate that key**, then blank the constant.
-2. **The `CEREBRAS_API_KEY` in `.env` is never read.** `find_api_key()` checks
-   the `API_KEY` constant *before* the environment and `.env`, so as long as the
-   constant is set, `.env` is dead config.
+```bash
+cp .env.example .env
+# GROQ_API_KEY=gsk_...
+```
 
-The resolution order is: `--api-key` flag → `API_KEY` constant → `GROQ_API_KEY`
-or `CEREBRAS_API_KEY` env var → the same two names in `.env`. So the fix is to
-set `API_KEY = ''` in `prompt_enhancer.py` and keep the real key in `.env` only.
-Add `.env` to a `.gitignore` while you're there.
+`.env` is gitignored, so the key stays out of the repo. The `API_KEY` constant
+in `prompt_enhancer.py` is deliberately left blank — filling it in would put a
+live credential one `git add .` away from being committed.
 
-Note that if you switch to the Cerebras key you must also change
-`DEFAULT_ENDPOINT` — a Cerebras key sent to Groq's endpoint just returns 401.
+Resolution order is: `--api-key` flag → `API_KEY` constant → `GROQ_API_KEY` or
+`CEREBRAS_API_KEY` in the environment → the same two names in `.env`.
+
+If you use a Cerebras key you must also change `DEFAULT_ENDPOINT` in
+`prompt_enhancer.py` — a Cerebras key sent to Groq's endpoint just returns 401.
 
 ---
 
@@ -197,7 +204,7 @@ no token is set.
 
 ### Getting an HTTPS address
 
-**Current method — cloudflared quick tunnel:**
+**Quickest — a cloudflared quick tunnel:**
 
 ```bash
 cloudflared tunnel --url http://localhost:30001
@@ -207,11 +214,12 @@ cloudflared tunnel --url http://localhost:30001
 Paste that into *Module Settings → Music server URL*. The catch: the hostname is
 random and **changes every restart**, so you re-paste it before every session.
 
-**Permanent replacement — Tailscale Funnel** (installed, setup not yet
-finished). Gives a fixed `https://<machine>.<tailnet>.ts.net` address for free,
-with no domain required, surviving restarts and reboots. To finish:
+**Permanent — Tailscale Funnel.** Gives a fixed
+`https://<machine>.<tailnet>.ts.net` address for free, with no domain required,
+surviving restarts and reboots:
 
 ```bash
+brew install tailscale
 sudo brew services start tailscale   # daemon, and on every reboot
 tailscale up                         # browser login
 ```
@@ -276,7 +284,7 @@ pick it up again when you restart.
 ## How it works
 
 ```
-  you type / a player types /music        this Mac
+  you type / a player types /music        your Mac
   ┌──────────────────────────┐            ┌────────────────────────────────┐
   │ "they enter the dungeon" │──POST────► │ prompt_enhancer.py             │
   │                          │  /prompt   │   └─ LLM → style descriptors   │
@@ -315,7 +323,8 @@ brief glitch beats drifting minutes behind the table.
 | [music_server.py](music_server.py) | HTTP server: MP3 broadcast, `/prompt`, `/status` |
 | [prompt_enhancer.py](prompt_enhancer.py) | Scene text → music style, via an LLM |
 | [foundry-module/](foundry-module/) | The Foundry VTT module and its setup guide |
-| `.env` | API keys (currently unread — see the API key section) |
+| `.env` | API keys — gitignored; copy `.env.example` to create it |
+| [foundry-module/build-release.sh](foundry-module/build-release.sh) | Builds the module zip for a GitHub release |
 
 ### HTTP endpoints (`--serve`)
 
