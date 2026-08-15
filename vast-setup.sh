@@ -24,7 +24,12 @@ say() { echo "[setup] $*"; }
 # A CUDA runtime image is Ubuntu plus CUDA libraries and nothing else -- no
 # python3, no git. python3-venv is also packaged separately from python3, and
 # venv creation fails with a confusing message when it is missing.
-if ! command -v git >/dev/null || ! python3 -c 'import venv' 2>/dev/null; then
+#
+# Test ensurepip, not venv: on Ubuntu `import venv` succeeds without
+# python3-venv installed, and creation then gets as far as making the directory
+# before dying on the missing bootstrap -- which leaves a .venv with no pip in
+# it, exactly the state the guard below has to survive.
+if ! command -v git >/dev/null || ! python3 -c 'import ensurepip' 2>/dev/null; then
   say "installing system packages"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
@@ -71,7 +76,13 @@ cd "$MUSIC_ROOT"
 # re-resolved on every boot.
 if [[ ! -f .venv/.provisioned ]]; then
   say "creating venv and installing (this is the slow part, several minutes)"
-  [[ -d .venv ]] || python3 -m venv .venv
+  # Presence of the directory is not proof of a usable venv: an interrupted run
+  # or a missing python3-venv leaves the tree there without bin/pip, and every
+  # later step then fails on "no such file". Rebuild unless pip is really there.
+  if [[ ! -x .venv/bin/pip ]]; then
+    [[ -e .venv ]] && { say "removing incomplete .venv"; rm -rf .venv; }
+    python3 -m venv .venv
+  fi
   .venv/bin/pip install -q --upgrade pip
   .venv/bin/pip install -q \
     "magenta-rt[jax]" "jax[cuda12]" soundfile lameenc requests numpy
