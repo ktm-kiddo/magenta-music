@@ -57,6 +57,30 @@ if ! grep -q 'MAGENTA_HOME' ~/.bashrc 2>/dev/null; then
   echo "export MAGENTA_HOME=$MAGENTA_HOME" >> ~/.bashrc
 fi
 
+# --- Session identity ------------------------------------------------------
+# A fixed token and a named tunnel are what let Foundry's two settings be filled
+# in once instead of every session. They arrive as Vast template environment
+# variables, which reach this script but not necessarily an interactive SSH
+# shell -- so persist them, and source them from .bashrc, or starting the player
+# by hand would silently fall back to a quick tunnel and a fresh token.
+ENV_FILE="${ENV_FILE:-/workspace/magenta.env}"
+if [[ -n "${MUSIC_TOKEN:-}${CF_TUNNEL_TOKEN:-}${MUSIC_HOSTNAME:-}" ]]; then
+  say "persisting session identity to $ENV_FILE"
+  # Written before the content, and only readable by root: this file holds the
+  # tunnel credential, which is worth more than the music.
+  install -m 600 /dev/null "$ENV_FILE"
+  {
+    [[ -n "${MUSIC_TOKEN:-}" ]]     && echo "MUSIC_TOKEN=$MUSIC_TOKEN"
+    [[ -n "${CF_TUNNEL_TOKEN:-}" ]] && echo "CF_TUNNEL_TOKEN=$CF_TUNNEL_TOKEN"
+    [[ -n "${MUSIC_HOSTNAME:-}" ]]  && echo "MUSIC_HOSTNAME=$MUSIC_HOSTNAME"
+    :
+  } >> "$ENV_FILE"
+
+  if ! grep -q "$ENV_FILE" ~/.bashrc 2>/dev/null; then
+    echo "set -a; . $ENV_FILE; set +a" >> ~/.bashrc
+  fi
+fi
+
 # --- Optional autostart ----------------------------------------------------
 # Off by default: a box that starts streaming the moment it boots is only
 # useful if Foundry already knows its address, which means a fixed token and a
@@ -70,6 +94,10 @@ if [[ "${MUSIC_AUTOSTART:1}" != "1" ]]; then
     cd $MUSIC_ROOT
     tmux new -s music
     MUSIC_TOKEN=\$(openssl rand -hex 16) ./start.sh --backend jax --model $MUSIC_MODEL
+
+A new shell sources $ENV_FILE, so if the template supplies MUSIC_TOKEN,
+CF_TUNNEL_TOKEN, or MUSIC_HOSTNAME you can drop the MUSIC_TOKEN= prefix above
+and just run ./start.sh -- the fixed address and token are already in scope.
 
 Set MUSIC_AUTOSTART=1 in the template to have this start on boot instead.
 Put your Groq key in $MUSIC_ROOT/.env to enable prompt rewriting.
@@ -87,21 +115,36 @@ fi
 token="${MUSIC_TOKEN:-$(openssl rand -hex 16)}"
 
 say "starting the player in tmux session 'music'"
+# The token goes through a file rather than the command line: a tmux command is
+# visible in ps to every process on the box, and CF_TUNNEL_TOKEN in particular
+# is a credential for your Cloudflare account, not just for this music server.
+# Only when it was generated here -- a supplied MUSIC_TOKEN is already in the
+# file, and appending it again would leave two lines to keep in agreement.
+if [[ -z "${MUSIC_TOKEN:-}" ]]; then
+  printf 'MUSIC_TOKEN=%s\n' "$token" >> "$ENV_FILE"
+fi
+chmod 600 "$ENV_FILE"
 tmux new-session -d -s music -c "$MUSIC_ROOT" \
-  "MUSIC_TOKEN=$token ./start.sh --backend jax --model $MUSIC_MODEL \
+  "set -a; . $ENV_FILE; set +a; ./start.sh --backend jax --model $MUSIC_MODEL \
      --preroll ${MUSIC_PREROLL:-6} --target-buffer ${MUSIC_TARGET_BUFFER:-4}"
 
-# The tunnel hostname is printed inside tmux, where nothing that reads this log
-# can see it. Lift it back out so the address is available without attaching.
-say "waiting for the tunnel address"
+# The address is printed inside tmux, where nothing reading this log can see it.
+# Lift it back out so it is available without attaching. A named tunnel has a
+# hostname known in advance, so there is nothing to wait for in that case.
 url=""
-for _ in $(seq 1 60); do
-  url=$(tmux capture-pane -p -t music 2>/dev/null \
-        | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1) || true
-  [[ -n "$url" ]] && break
-  tmux has-session -t music 2>/dev/null || { say "the player exited early:"; tmux capture-pane -p -t music 2>/dev/null || true; exit 1; }
-  sleep 1
-done
+if [[ -n "${MUSIC_HOSTNAME:-}" ]]; then
+  url="https://${MUSIC_HOSTNAME#https://}"
+  url="${url%/}"
+else
+  say "waiting for the tunnel address"
+  for _ in $(seq 1 60); do
+    url=$(tmux capture-pane -p -t music 2>/dev/null \
+          | grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' | head -1) || true
+    [[ -n "$url" ]] && break
+    tmux has-session -t music 2>/dev/null || { say "the player exited early:"; tmux capture-pane -p -t music 2>/dev/null || true; exit 1; }
+    sleep 1
+  done
+fi
 
 {
   echo "Music server URL:   ${url:-<not reported -- run: tmux attach -t music>}"

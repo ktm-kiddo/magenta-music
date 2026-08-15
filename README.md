@@ -282,6 +282,24 @@ cloudflared tunnel --url http://localhost:30001
 Paste that into *Module Settings → Music server URL*. The catch: the hostname is
 random and **changes every restart**, so you re-paste it before every session.
 
+**Permanent — a named Cloudflare tunnel.** Requires a domain on Cloudflare.
+Create the tunnel under Zero Trust → Networks → Tunnels, route your chosen
+hostname to `http://localhost:30001`, and copy the tunnel token. Then:
+
+```bash
+CF_TUNNEL_TOKEN=<token> MUSIC_HOSTNAME=music.example.com \
+  MUSIC_TOKEN=<a fixed secret> ./start.sh
+```
+
+`start.sh` runs the named tunnel instead of a quick one, and the hostname is
+yours permanently. Fix `MUSIC_TOKEN` as well and **both** Foundry settings are
+filled in once and never touched again — which is the difference between a
+server you reconfigure every session and one you just start.
+
+Keep the tunnel token out of the repo and out of any image: it is a credential
+for your Cloudflare account, not just for this music server. On Vast, pass it as
+a template environment variable.
+
 **Permanent — Tailscale Funnel.** Gives a fixed
 `https://<machine>.<tailnet>.ts.net` address for free, with no domain required,
 surviving restarts and reboots:

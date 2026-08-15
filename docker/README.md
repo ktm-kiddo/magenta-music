@@ -72,18 +72,26 @@ is a published token.
 |---|---|---|
 | `MUSIC_AUTOSTART` | `0` | `1` starts the player in tmux at boot |
 | `MUSIC_TOKEN` | generated per boot | Fix it and Foundry's token setting stops changing |
+| `CF_TUNNEL_TOKEN` | — | Named-tunnel token; fixes the hostname too |
+| `MUSIC_HOSTNAME` | — | The hostname routed to `localhost:30001`, e.g. `music.example.com` |
 | `MUSIC_MODEL` | `mrt2_small` | Must be a model baked into the image |
 | `MUSIC_REPO` | this repo | Point it at a fork |
 | `MUSIC_PREROLL` | `6` | Seconds buffered before playback starts |
 | `MUSIC_TARGET_BUFFER` | `4` | Buffer depth; also bounds prompt latency |
 
+Whichever of these are set get written to `/workspace/magenta.env` (mode 600)
+and sourced by new shells, so starting the player by hand picks up the same
+fixed address and token rather than silently falling back to a quick tunnel.
+
 With `MUSIC_AUTOSTART=1` the instance comes up already streaming, and the URL
 and token are written to `/workspace/music-session.txt`. Attach to the console
 with `tmux attach -t music`.
 
-Autostart is only fully hands-off with a **named** Cloudflare tunnel, which
-gives a fixed hostname. With a quick tunnel the address changes every boot, so
-you still have to read the file and re-paste it into Foundry.
+Autostart is only fully hands-off with a fixed address — `CF_TUNNEL_TOKEN` plus
+`MUSIC_HOSTNAME`, or a Tailscale Funnel hostname. With a quick tunnel the
+address changes every boot, so you still have to read the file and re-paste it
+into Foundry, and a box that boots streaming to an address Foundry does not know
+is not actually saving you anything.
 
 ## When to rebuild
 
