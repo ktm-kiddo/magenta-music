@@ -18,8 +18,8 @@ Two ways to use it:
 Requires an Apple Silicon Mac and Python 3.12 — see [Requirements](#requirements).
 
 ```bash
-git clone https://github.com/OWNER/REPO.git magenta-live-music
-cd magenta-live-music
+git clone https://github.com/ktm-kiddo/magenta-music.git
+cd magenta-music
 
 python3.12 -m venv .venv
 .venv/bin/pip install magenta-rt mlx mlx-metal sounddevice soundfile lameenc requests

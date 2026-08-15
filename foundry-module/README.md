@@ -25,7 +25,7 @@ table of five needs roughly 0.6 Mbit/s of upstream.
 *Add-on Modules → Install Module → Manifest URL*, paste:
 
 ```
-https://raw.githubusercontent.com/OWNER/REPO/main/foundry-module/magenta-music/module.json
+https://raw.githubusercontent.com/ktm-kiddo/magenta-music/main/foundry-module/magenta-music/module.json
 ```
 
 **Or copy the folder in,** if Foundry runs on a machine you control:
@@ -130,8 +130,10 @@ token is set.
 - **The Forge:** you cannot drop files into `Data/modules`, so use the manifest
   URL from step 1 — that is exactly what it is there for.
 
-To cut a new release after changing the module, bump `version` in `module.json`,
-then:
+To cut a new release after changing the module, edit `module.json` to bump
+**both** `version` and the tag inside `download` — Foundry compares the manifest
+version against the installed one, then fetches whatever `download` points at,
+so a stale tag there quietly reinstalls the old code. Then:
 
 ```bash
 ./foundry-module/build-release.sh
