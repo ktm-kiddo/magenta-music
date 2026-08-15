@@ -44,6 +44,7 @@ let statusTimer = null;
 let inflight = null;      // de-duplicates concurrent status polls
 let lastError = null;     // MusicError currently worth showing the user
 let notifiedErrors = new Map();  // message -> timestamp, to not repeat ourselves
+let notedPath = false;    // the "URL has a path" note is a once-per-session log
 
 /* Sidebar panel ----------------------------------------------------------- */
 let panel = null;
@@ -185,9 +186,10 @@ function fatalConfigurationProblem() {
       { page: window.location.protocol, server: url.protocol });
   }
 
-  if (url.pathname && url.pathname !== "/" && !setting("suppressPathWarning")) {
+  if (url.pathname && url.pathname !== "/" && !notedPath) {
     // Not a problem -- a reverse proxy route like /music is a supported setup
-    // -- but a stray path is a common paste error, so it is worth naming.
+    // -- but a stray path is a common paste error, so it is worth naming once.
+    notedPath = true;
     log(`note: server URL includes the path "${url.pathname}"; `
       + "that is correct only if a reverse proxy serves the music server there");
   }
@@ -1077,8 +1079,10 @@ function injectPanel(root) {
 }
 
 function ensureStatusPolling() {
-  if (statusTimer) return;
+  // Always refresh on injection: opening the tab is a request to see the
+  // truth now, not up to one poll interval from now.
   fetchStatus().catch(() => { /* already reported and drawn */ });
+  if (statusTimer) return;
   statusTimer = setInterval(() => {
     // Polling exists to keep the panel truthful; stop when nobody can see it.
     if (!panel?.isConnected) {
@@ -1399,13 +1403,6 @@ Hooks.once("init", () => {
     default: true
   });
 
-  game.settings.register(MODULE_ID, "suppressPathWarning", {
-    scope: "client",
-    config: false,
-    type: Boolean,
-    default: false
-  });
-
   // Foundry v14 parses chat commands from a registry. Registering here means
   // /music is a real command rather than something intercepted after the fact.
   const ChatLog = foundry.applications?.sidebar?.tabs?.ChatLog;
@@ -1429,6 +1426,17 @@ Hooks.once("ready", () => {
   });
 
   refreshPlaybackState();
+
+  // Foundry builds its audio buses on the first user gesture. If we started
+  // before that happened we are playing direct, and the core Music slider is
+  // being applied by hand -- so reconnect through the mixer once it exists.
+  game.audio?.unlock?.then(() => {
+    if (audio && !bus && !busDisabled && setting("useMusicBus")) {
+      log("Foundry's audio mixer is up; reconnecting through the Music channel");
+      startPlayback({ restart: true });
+    }
+  });
+
   // One deliberate check on load, so a session that is going to be silent says
   // why now rather than when someone first tries to use it. Players are only
   // told about things they can act on; the rest is the GM's to fix.

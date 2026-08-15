@@ -151,15 +151,63 @@ Drop `--serve-bitrate` to 96 or 64 if that is tight.
 
 ## 4. Play
 
+### From the Music tab
+
+The module adds a **Live Music** panel to the top of Foundry's Playlists
+("Music") sidebar tab, above the volume controls. It is the stream's transport:
+
+- **Play / pause.** For a GM this starts and stops the music for the *whole
+  table*; for a player it is their own mute. GMs get a second headphones button
+  to silence themselves without stopping everyone.
+- **Jump to live** skips whatever delay your browser has accumulated.
+- **Volume**, on top of Foundry's own global Music slider.
+- **A prompt box and preset buttons** for anyone allowed to steer.
+- **Generation settings** — cross-fade, temperature, style strength — under a
+  fold, applied to the server for everyone.
+- **Errors, in place**, with a *Diagnose* button when something is wrong.
+
+Because the stream is routed through Foundry's Music audio channel, the core
+Music volume slider governs it exactly as it governs a playlist track. If the
+browser cannot route it that way — a proxy that strips CORS headers is the
+usual reason — the module falls back to direct playback and applies the slider
+itself, which is a fallback you should never notice.
+
+### From chat
+
 | Command | Effect |
 |---|---|
 | `/music the floor gives way` | Rewrites the scene into a style and morphs to it |
 | `/music raw dark ambient, low strings` | Skips the AI rewrite, uses your words |
-| `/music status` | Current style, listener count |
-| `/music on` / `/music off` | Mutes the stream for **you** only |
+| `/music status` | Current style, listener count, generation rate |
+| `/music diagnose` | Checks every reason it might not be working |
+| `/music play` / `pause` | The table if you are the GM, otherwise just you |
+| `/music on` / `off` | Mutes the stream for **you** only |
+| `/music sync` | Jump to the live edge |
+| `/music volume 0.4` | Your own volume |
+| `/music morph 3` | Cross-fade seconds |
+| `/music temp 1.2` / `cfg 3` / `topk 40` | Generation knobs |
+| `/music llm on` / `off` | Prompt rewriting |
+| `/music presets` | List the configured presets |
 | `/music` | Help |
 
-Anyone at the table can use it, per your setup choice.
+Who may steer is set under *Module Settings → Who can change the music*:
+everyone, trusted players and up, or GMs only.
+
+## When it does not work
+
+Run **`/music diagnose`**, or press *Diagnose* in the Music tab. It walks every
+failure mode in order and reports what each one says: whether the URL is set and
+scheme-compatible, whether the server answers, whether a failure is the server
+being down or CORS being stripped, whether the token is accepted for both
+`/status` and `/stream.mp3`, whether the generator is starving, and whether your
+own volume or the GM's stop is the reason for the silence.
+
+That exists because silence has half a dozen indistinguishable causes. The
+module also names them as they happen rather than logging "unreachable": a 403
+says whether the token is wrong or missing, a 404 says the address is not the
+music server, an `http://` URL on an `https://` page is refused as mixed content
+*before* the request, and a `localhost` URL is called out as unreachable from
+anywhere but the GM's own machine.
 
 ## Things that will bite you
 
@@ -169,6 +217,6 @@ Anyone at the table can use it, per your setup choice.
   rewrite (~0.4 s), cross-fade (1.6 s), plus browser buffering.
 - **The stream is live, not a playlist.** Latecomers join wherever the music
   currently is; there is no seeking or rewinding.
-- **Volume** rides Foundry's ambient slider times the module's own slider.
+- **Volume** is the global Music slider times the module's own slider.
 - **Killing the Python process** ends the stream; clients retry with backoff and
   pick it up again when you restart.

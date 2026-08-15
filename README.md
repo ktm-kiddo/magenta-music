@@ -79,9 +79,14 @@ Then in Foundry, under *Module Settings*:
 | Music server URL | the printed `https://…trycloudflare.com` address |
 | Music server token | the printed token |
 
-Now anyone at the table can type `/music they enter the dungeon` in chat. The
-prompt you're left at is the same player console as solo mode, so you can also
-steer it from the terminal. Ctrl-C stops the server and the tunnel together.
+Now anyone at the table can type `/music they enter the dungeon` in chat, or use
+the **Live Music** panel the module adds to Foundry's Music tab — play/pause for
+the whole table, volume, a prompt box, preset buttons, and the generation knobs.
+The prompt you're left at is the same player console as solo mode, so you can
+also steer it from the terminal. Ctrl-C stops the server and the tunnel together.
+
+If the table hears nothing, `/music diagnose` in Foundry chat checks every cause
+in turn and says which one it is.
 
 **Both values change every run.** A quick tunnel gets a new random hostname each
 time it starts, and the token above is freshly generated, so you re-paste both
@@ -418,10 +423,14 @@ chmod +x /usr/local/bin/cloudflared
 ```
 
 **Pick a template with Python 3.12.** `magenta-rt` itself only wants 3.11, but
-`jax` 0.11 requires 3.12, and jax is what makes the GPU go. Ubuntu 24.04 images
-ship 3.12 as `python3`. You do *not* need a CUDA devel image — `jax[cuda12]`
-brings the CUDA runtime along as pip wheels, so all the host has to provide is a
-recent NVIDIA driver (any 12.x-capable one, 535+).
+`jax` 0.11 requires 3.12, and jax is what makes the GPU go. Ubuntu 24.04 is the
+first release whose `python3` is 3.12, which is what pins the image choice.
+
+You do *not* need a CUDA devel image — `jax[cuda12]` brings the CUDA runtime
+along as pip wheels, so the base image's CUDA version barely matters and all the
+host must supply is a driver new enough for CUDA 12 (535+). A `runtime` tag is
+the smaller, correct pick. Note it ships no `python3` and no `git` at all;
+[vast-setup.sh](vast-setup.sh) installs both.
 
 **Point the assets at your persistent volume.** They default to
 `~/Documents/Magenta`, which on a container is `/root/Documents` — easy to lose
@@ -449,7 +458,7 @@ they're called this month:
 
 | Field | Value |
 |---|---|
-| Docker image | `nvidia/cuda:12.4.1-runtime-ubuntu24.04` (24.04 for Python 3.12; `runtime`, not `devel`) |
+| Docker image | `nvidia/cuda:12.6.3-runtime-ubuntu24.04` — 24.04 for Python 3.12, `runtime` not `devel`. Ubuntu 24.04 builds start at CUDA 12.5.1; older tags like `12.4.1-runtime-ubuntu24.04` do not exist and fail with `manifest unknown`. |
 | Launch mode | SSH — you want a shell for `tmux` and the player console |
 | Disk space | 40 GB (≈6 GB CUDA wheels + 2.4 GB assets, plus room for `mrt2_base` later) |
 | Environment | `MAGENTA_HOME=/workspace/magenta`, and `GROQ_API_KEY=…` if you want prompt rewriting |
@@ -578,8 +587,15 @@ brief glitch beats drifting minutes behind the table.
 |---|---|
 | `GET /` | Test page with a player and prompt box |
 | `GET /stream.mp3` | The endless stream, one connection per listener |
-| `GET /status` | JSON: current prompt, model, listener count |
-| `POST /prompt` | JSON `{"text": ..., "raw": false, "morph": 2.0}` |
+| `GET /status` | JSON: prompt, model, backend, listeners, and every knob below |
+| `POST /prompt` | JSON `{"text": ..., "raw": false}` plus any knob to retune |
 
 All accept the token as `?token=...` or an `X-Music-Token` header — the query
 parameter exists because an `<audio>` element cannot send custom headers.
+
+`POST /prompt` takes `morph`, `temp`, `topk`, `cfg` and `llm` alongside (or
+instead of) `text`, so a client can retune without changing the style. Values
+are clamped rather than rejected — they arrive from a slider in someone else's
+browser, and a wild number should not be able to destabilise the generator
+mid-session. The response echoes the full `/status` payload, so a client never
+needs a follow-up request to redraw itself.
