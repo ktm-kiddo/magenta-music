@@ -45,27 +45,75 @@ Type to steer it, /status, /save out.wav, /quit.
   -> morphing over 1.6s
 ```
 
-### With Foundry (players listen in their browsers)
+---
+
+## Running a session with Foundry
+
+Everything below is per-session, from cold. One command does all of it:
 
 ```bash
-.venv/bin/python stream_player.py --serve --no-local-audio
-```
-
-Or, to bring up the server *and* a Cloudflare tunnel and have the URL printed
-for you — which is what remote players need — use the wrapper:
-
-```bash
+cd magenta-music
 MUSIC_TOKEN=$(openssl rand -hex 16) ./start.sh
 ```
 
-It prints the `https://…trycloudflare.com` address to paste into *Module
-Settings → Music server URL*, then hands you the normal player console. Set
-`MUSIC_TOKEN` (and match it in *Module Settings → Music server token*) whenever
-the tunnel is public, which a quick tunnel always is.
+That starts the music server, opens a Cloudflare tunnel so remote players can
+reach it, and prints what you need:
 
-Then open <http://localhost:30001/> in a browser to confirm it works before
-involving Foundry. That page has a player and a prompt box — if you hear music
-there, the server half is working.
+```
+  Music server URL (paste into Foundry module settings):
+    https://cursor-cathedral-beliefs-potentially.trycloudflare.com
+
+  Music server token (paste into Foundry module settings):
+    3f9a1c7e5b2d8046a1f3c9e7b5d20486
+
+Loading mrt2_small...
+Buffering 1.0s... playing.
+
+>
+```
+
+Then in Foundry, under *Module Settings*:
+
+| Setting | Value |
+|---|---|
+| Music server URL | the printed `https://…trycloudflare.com` address |
+| Music server token | the printed token |
+
+Now anyone at the table can type `/music they enter the dungeon` in chat. The
+prompt you're left at is the same player console as solo mode, so you can also
+steer it from the terminal. Ctrl-C stops the server and the tunnel together.
+
+**Both values change every run.** A quick tunnel gets a new random hostname each
+time it starts, and the token above is freshly generated, so you re-paste both
+each session. To stop re-pasting, use a named tunnel or [Tailscale
+Funnel](#getting-an-https-address) for a fixed hostname, and a fixed token.
+
+**Drop `MUSIC_TOKEN=…` and there is no password** — anyone who learns the URL can
+listen and change the music. That is fine on a LAN, but a `trycloudflare.com`
+address is on the open internet. The script warns you when it is missing.
+
+### Doing it without the wrapper
+
+Two terminals, which is all `start.sh` is doing:
+
+```bash
+.venv/bin/python stream_player.py --serve --no-local-audio
+cloudflared tunnel --url http://localhost:30001   # second terminal
+```
+
+The tunnel prints its hostname on startup. `--serve` is the flag that opens port
+30001 — without it there is nothing for the tunnel to point at, and players get
+a 502.
+
+If your players are on the same LAN you can skip the tunnel entirely and use
+`http://<your-mac>:30001` — but only if Foundry itself is served over plain
+HTTP, since an HTTPS page cannot load an HTTP stream.
+
+### Check it before the game
+
+Open <http://localhost:30001/> in a browser. That page has a player and a prompt
+box; if you hear music there, the server half is working and anything still
+broken is in Foundry's settings or the tunnel.
 
 `--no-local-audio` stops your Mac's speakers. Use it whenever *you* are also
 listening through Foundry, otherwise you hear the same music twice, offset by

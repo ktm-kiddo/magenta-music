@@ -54,7 +54,13 @@ echo
 echo "  Music server URL (paste into Foundry module settings):"
 echo "    $url"
 echo
-if [[ -z "${MUSIC_TOKEN:-}" ]]; then
+if [[ -n "${MUSIC_TOKEN:-}" ]]; then
+  # Generated inline (MUSIC_TOKEN=$(openssl rand -hex 16)) the value is never
+  # seen otherwise, and it has to be typed into Foundry to match.
+  echo "  Music server token (paste into Foundry module settings):"
+  echo "    $MUSIC_TOKEN"
+  echo
+else
   echo "  No MUSIC_TOKEN set: anyone with that URL can hear and change the music."
   echo
 fi
