@@ -175,8 +175,15 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
   def _cors(self):
     self.send_header('Access-Control-Allow-Origin', '*')
-    self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+    # X-Music-Token has to be listed or the browser fails the preflight and
+    # never sends the real request: a custom header is what makes /status and
+    # /prompt preflighted in the first place. The <audio> element passes the
+    # token in the query string instead, so the stream keeps working and only
+    # the control endpoints break -- audio playing is no evidence this is right.
+    self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Music-Token')
     self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    # Without this the browser preflights every single /status poll.
+    self.send_header('Access-Control-Max-Age', '86400')
 
   def _send_json(self, payload: dict, status: int = 200):
     body = json.dumps(payload).encode()
