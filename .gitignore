@@ -1,0 +1,16 @@
+# Secrets — never commit
+.env
+
+# Machine-local Claude Code settings
+.claude/settings.local.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Build output
+dist/
+
+# macOS
+.DS_Store
