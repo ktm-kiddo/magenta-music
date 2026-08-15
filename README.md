@@ -51,6 +51,18 @@ Type to steer it, /status, /save out.wav, /quit.
 .venv/bin/python stream_player.py --serve --no-local-audio
 ```
 
+Or, to bring up the server *and* a Cloudflare tunnel and have the URL printed
+for you — which is what remote players need — use the wrapper:
+
+```bash
+MUSIC_TOKEN=$(openssl rand -hex 16) ./start.sh
+```
+
+It prints the `https://…trycloudflare.com` address to paste into *Module
+Settings → Music server URL*, then hands you the normal player console. Set
+`MUSIC_TOKEN` (and match it in *Module Settings → Music server token*) whenever
+the tunnel is public, which a quick tunnel always is.
+
 Then open <http://localhost:30001/> in a browser to confirm it works before
 involving Foundry. That page has a player and a prompt box — if you hear music
 there, the server half is working.
@@ -319,6 +331,7 @@ brief glitch beats drifting minutes behind the table.
 
 | File | What it is |
 |---|---|
+| [start.sh](start.sh) | Server + Cloudflare tunnel in one command, prints the URL |
 | [stream_player.py](stream_player.py) | Main entry point — generation loop, buffer, console |
 | [music_server.py](music_server.py) | HTTP server: MP3 broadcast, `/prompt`, `/status` |
 | [prompt_enhancer.py](prompt_enhancer.py) | Scene text → music style, via an LLM |
