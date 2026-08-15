@@ -4,9 +4,15 @@ A prebuilt image for Vast.ai that skips provisioning. A fresh instance costs a
 Vast image pull instead of an install: the CUDA wheels and the model weights —
 the two things that make `vast-setup.sh` take minutes — are already inside.
 
-The repo itself is **not** baked in. `magenta-bootstrap` clones or pulls it at
-boot, so a code change costs a `git pull`, not a rebuild and a 10 GB push. Only
-a dependency change or a different baked model needs a new image.
+The repo itself is **not** baked in, and neither is most of the boot logic. What
+the image carries is [`bootstrap-shim.sh`](bootstrap-shim.sh), installed as
+`magenta-bootstrap`: it repairs SSH permissions, clones or pulls the repo, and
+hands off to [`magenta-bootstrap.sh`](magenta-bootstrap.sh) from the clone.
+
+That split exists because v1 shipped with a broken SSH setup, which locked the
+box out of every route that could have fixed it. Now anything about how the
+instance boots ships with a `git pull`; only dependencies and baked weights
+need a new image.
 
 ## Build it in CI (recommended)
 
@@ -100,6 +106,8 @@ is not actually saving you anything.
 - You want a different model baked in → rebuild
 - Any change to the Python or Foundry code → **no rebuild**, just restart the
   instance or `git pull` in `/workspace/magenta-music`
+- Any change to boot behaviour, including autostart and the environment file →
+  **no rebuild**, it lives in the repo behind the shim
 
 If you are stopping and starting one instance rather than renting fresh boxes,
 you do not need this image at all — `/workspace` already persists, so a stopped

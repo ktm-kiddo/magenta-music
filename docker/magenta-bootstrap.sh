@@ -103,7 +103,7 @@ fi
 # useful if Foundry already knows its address, which means a fixed token and a
 # named tunnel. With a quick tunnel the hostname changes every boot and you
 # have to come and read it anyway.
-if [[ "${MUSIC_AUTOSTART:1}" != "1" ]]; then
+if [[ "${MUSIC_AUTOSTART:-0}" != "1" ]]; then
   cat <<EOF
 
 [bootstrap] Ready. To start a session:

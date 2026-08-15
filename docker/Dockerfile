@@ -77,7 +77,17 @@ RUN "$MUSIC_VENV/bin/mrt" models init \
 # image, skips its install step instead of redoing all of the above.
 RUN touch "$MUSIC_VENV/.provisioned"
 
-COPY magenta-bootstrap.sh /usr/local/bin/magenta-bootstrap
+# sshd will not read a key file that others could have written, and Vast creates
+# this directory itself if the image has not. Creating it here with the right
+# mode is what stops "Authentication refused: bad ownership or modes" -- an
+# error the client never sees, since from its side the key is simply refused.
+RUN mkdir -p /root/.ssh \
+ && chmod 700 /root /root/.ssh
+
+# Only the shim is baked in. It repairs SSH permissions, fetches the repo, and
+# hands off to the repo's own bootstrap -- so boot logic ships with a git pull
+# rather than a rebuild.
+COPY bootstrap-shim.sh /usr/local/bin/magenta-bootstrap
 RUN chmod +x /usr/local/bin/magenta-bootstrap
 
 # Every later `mrt` call has to resolve the same MAGENTA_HOME, or it silently
