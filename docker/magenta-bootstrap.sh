@@ -84,8 +84,9 @@ fi
 # --- Groq key --------------------------------------------------------------
 # .env is gitignored, so it never arrives with the clone -- which on a fresh
 # instance means the one remaining manual step. Taking the key from the template
-# environment removes it, and this is the only reason the file needs writing at
-# all: prompt_enhancer reads .env, not the environment.
+# environment removes it. prompt_enhancer checks the environment before it
+# checks .env, so the file is belt and braces: it is what makes the key survive
+# into a shell or tmux session that did not inherit the template's variables.
 if [[ -n "${GROQ_API_KEY:-}" ]]; then
   if [[ ! -f "$MUSIC_ROOT/.env" ]]; then
     say "writing Groq key to $MUSIC_ROOT/.env"
