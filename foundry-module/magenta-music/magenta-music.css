@@ -1,0 +1,189 @@
+/*
+ * The transport panel lives inside Foundry's Playlists sidebar, directly above
+ * the global volume sliders, so it borrows the sidebar's own variables rather
+ * than setting colours of its own -- it should read as part of the tab, and it
+ * should follow the user's theme without knowing anything about it.
+ */
+
+.magenta-music-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px 8px;
+  font-size: var(--font-size-13, 13px);
+}
+
+.magenta-music-panel .mm-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.magenta-music-panel .mm-header strong {
+  flex: 1;
+}
+
+.magenta-music-panel .mm-state {
+  font-size: var(--font-size-11, 11px);
+  text-transform: lowercase;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.magenta-music-panel .mm-state::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: baseline;
+}
+
+/* Live is the only state worth colouring; everything else stays quiet. */
+.magenta-music-panel .mm-state-live::before {
+  background: #4caf50;
+  box-shadow: 0 0 4px #4caf50;
+}
+
+.magenta-music-panel .mm-state-idle::before { background: #d0a942; }
+.magenta-music-panel .mm-state-off::before { background: #b0483f; }
+
+.magenta-music-panel .mm-now {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.magenta-music-panel .mm-style {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+}
+
+.magenta-music-panel .mm-transport {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.magenta-music-panel .mm-volume {
+  flex: 1;
+  min-width: 0;
+}
+
+.magenta-music-panel .mm-meta {
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.7;
+}
+
+.magenta-music-panel .mm-steer {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.magenta-music-panel .mm-prompt {
+  flex: 1;
+  min-width: 0;
+}
+
+.magenta-music-panel .mm-raw {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.8;
+}
+
+.magenta-music-panel .mm-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.magenta-music-panel .mm-preset {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 1px 7px;
+  line-height: 1.6;
+  font-size: var(--font-size-11, 11px);
+  border-radius: 3px;
+}
+
+.magenta-music-panel .mm-advanced summary {
+  cursor: pointer;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.8;
+}
+
+.magenta-music-panel .mm-knob {
+  display: grid;
+  grid-template-columns: 5.5em 1fr 3em;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-panel .mm-knob output {
+  text-align: right;
+  opacity: 0.8;
+}
+
+.magenta-music-panel .mm-diag {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-top: 4px;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.7;
+}
+
+/*
+ * The error banner is the whole point of the diagnostics work: silence has
+ * many causes and they all look identical, so when we know which one it is,
+ * it gets said here in full rather than truncated to fit.
+ */
+.magenta-music-panel .mm-error {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 6px;
+  padding: 5px 7px;
+  border-radius: 3px;
+  border: 1px solid rgba(180, 60, 50, 0.6);
+  background: rgba(180, 60, 50, 0.12);
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-panel .mm-error > i {
+  color: #d9645a;
+  padding-top: 2px;
+}
+
+.magenta-music-panel .mm-error-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.magenta-music-panel .mm-error-text span {
+  opacity: 0.85;
+}
+
+.magenta-music-panel .mm-diagnose {
+  grid-column: 2;
+  justify-self: start;
+  width: auto;
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  line-height: 1.6;
+  font-size: var(--font-size-11, 11px);
+  border-radius: 3px;
+}
