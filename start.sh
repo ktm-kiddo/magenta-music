@@ -28,6 +28,33 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
+# --- .env ------------------------------------------------------------------
+# The API key already lives here, so the tunnel and token settings are the
+# obvious things to put beside it -- and doing that used to fail silently, with
+# a quick unauthenticated tunnel where a named one was intended.
+#
+# Parsed rather than sourced: this file is a config file people paste secrets
+# into, not a script, and `.` would execute whatever a stray backtick turned
+# into. Values already in the environment win, matching how prompt_enhancer
+# resolves the API key, so a one-off MUSIC_TOKEN=... prefix still overrides.
+if [[ -f .env ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"                       # tolerate CRLF
+    line="${line#"${line%%[![:space:]]*}"}"    # strip leading whitespace
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    key="${key#export }"
+    key="${key//[[:space:]]/}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ -n "${!key:-}" ]] && continue           # already set: the environment wins
+    value="${line#*=}"
+    if [[ "$value" == \"*\" ]]; then value="${value#\"}"; value="${value%\"}"
+    elif [[ "$value" == \'*\' ]]; then value="${value#\'}"; value="${value%\'}"
+    fi
+    export "$key=$value"
+  done < .env
+fi
+
 # One source of truth: the tunnel and the player must agree on the port, so
 # override it here rather than passing --serve-port through.
 PORT="${MUSIC_PORT:-30001}"
