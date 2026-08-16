@@ -51,6 +51,10 @@ let panel = null;
 let dragging = false;     // a slider is being dragged; don't redraw under it
 let draft = { text: "", raw: false, advanced: false };  // survives re-renders
 
+/* Presets ----------------------------------------------------------------- */
+let PresetManagerClass = null;  // built at init, once Foundry's classes exist
+let presetManager = null;       // the one open manager window
+
 // Whatever the browser buffers before it starts playing becomes permanent
 // delay: from then on it receives and plays at the same rate, so the gap never
 // closes on its own. Left alone that is several seconds between someone typing
@@ -64,13 +68,33 @@ const REQUEST_TIMEOUT_MS = 6000;
 const NOTIFY_COOLDOWN_MS = 60000;
 
 const DEFAULT_PRESETS = [
-  "Tavern | warm lute and fiddle, cheerful medieval tavern, light percussion",
-  "Travel | gentle pastoral strings, rolling rhythm, hopeful woodwinds",
-  "Dungeon | slow ominous drone, low strings, dark ambient, sparse percussion",
-  "Combat | urgent orchestral strings, driving percussion, tense brass, fast",
-  "Boss | huge choir, thunderous timpani, brass fanfare, epic orchestral",
-  "Sorrow | solo cello, sparse piano, mournful and slow"
-].join("\n");
+  { label: "Tavern", style: "warm lute and fiddle, cheerful medieval tavern, light percussion" },
+  { label: "Travel", style: "gentle pastoral strings, rolling rhythm, hopeful woodwinds" },
+  { label: "Dungeon", style: "slow ominous drone, low strings, dark ambient, sparse percussion" },
+  { label: "Combat", style: "urgent orchestral strings, driving percussion, tense brass, fast" },
+  { label: "Boss", style: "huge choir, thunderous timpani, brass fanfare, epic orchestral" },
+  { label: "Sorrow", style: "solo cello, sparse piano, mournful and slow" }
+];
+
+// What the 1.1 text-box setting held. Kept only so an existing world's presets
+// survive the move to structured ones; see migratePresets().
+const LEGACY_DEFAULT_PRESETS = DEFAULT_PRESETS
+  .map(p => `${p.label} | ${p.style}`).join("\n");
+
+// Generation knobs a preset may pin. Anything absent is left as the server has
+// it, so a preset can change the style, the knobs, or both.
+const TUNING_KEYS = ["morph", "temp", "cfg", "topk"];
+
+const TUNING_FIELDS = {
+  morph: { label: "Cross-fade", min: 0, max: 30, step: 0.5, unit: "s",
+           hint: "Seconds to morph into this style." },
+  temp: { label: "Temperature", min: 0.05, max: 4, step: 0.05, unit: "",
+          hint: "Higher wanders further from the style; lower is steadier." },
+  cfg: { label: "Style strength", min: 0, max: 10, step: 0.25, unit: "",
+         hint: "How hard the model is pushed toward the prompt." },
+  topk: { label: "Top-k", min: 1, max: 1024, step: 1, unit: "",
+          hint: "Sampling width. Leave alone unless you know you want it." }
+};
 
 /* ------------------------------------------------------------------ utils */
 
@@ -98,6 +122,17 @@ function tokenQuery(prefix = "?") {
 
 function esc(value) {
   return foundry.utils.escapeHTML(String(value ?? ""));
+}
+
+/**
+ * Caret position, or null where there is no such thing.
+ *
+ * Number and range inputs throw on `selectionStart` rather than returning
+ * nothing, and both kinds are focused while a redraw is going on here.
+ */
+function caretOf(element) {
+  try { return element?.selectionStart ?? null; }
+  catch (err) { return null; }
 }
 
 /** Can this user change what the whole table hears? */
@@ -542,12 +577,12 @@ async function sendPrompt(text, { raw = false, tuning = {} } = {}) {
  * The one path everything uses to change the music: chat command, sidebar
  * prompt box, and preset buttons all land here.
  */
-async function steer(text, { raw = false, announce = true } = {}) {
+async function steer(text, { raw = false, announce = true, tuning = {} } = {}) {
   if (!canSteer()) {
     throw new MusicError("You do not have permission to change the music.",
       "The GM controls this under Module Settings → Who can change the music.");
   }
-  const data = await sendPrompt(text, { raw });
+  const data = await sendPrompt(text, { raw, tuning });
   if (announce && setting("announceInChat")) {
     // Everyone should see why the music changed, so this one is public.
     await ChatMessage.create({
@@ -789,10 +824,25 @@ async function setPlaying(playing, { table = game.user.isGM } = {}) {
   }
 }
 
-/* -------------------------------------------------------- sidebar panel */
+/* --------------------------------------------------------------- presets */
 
-function parsePresets() {
-  return (setting("presets") ?? "").split(/[\n;]+/)
+/**
+ * A preset is {id, label, style, raw, tuning}: a button that sends one style
+ * to the server, optionally pinning generation knobs along with it.
+ *
+ * They are stored as structured data in the "presetList" world setting and
+ * edited in the preset manager. Before 1.2 they were lines of
+ * "Label | style" text in the "presets" setting, which is still read as a
+ * fallback and migrated on first load.
+ */
+
+function newPresetId() {
+  return foundry.utils?.randomID?.() ?? `p${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** "Label | style prompt", the pre-1.2 format. */
+function parseLegacyPresets(text) {
+  return (text ?? "").split(/[\n;]+/)
     .map(line => line.trim()).filter(Boolean)
     .map(line => {
       const [label, ...rest] = line.split("|");
@@ -802,6 +852,149 @@ function parsePresets() {
     })
     .filter(p => p.label);
 }
+
+/**
+ * Fill in everything a preset needs, from whatever shape it was stored in.
+ * @returns {object|null} null for an entry too empty to be a button.
+ */
+function normalizePreset(entry) {
+  if (typeof entry === "string") entry = parseLegacyPresets(entry)[0];
+  if (!entry) return null;
+
+  const style = String(entry.style ?? "").trim();
+  const label = String(entry.label ?? "").trim() || labelFromStyle(style);
+  if (!label && !style) return null;
+
+  const tuning = {};
+  for (const key of TUNING_KEYS) {
+    const value = Number(entry.tuning?.[key]);
+    if (Number.isFinite(value)) tuning[key] = value;
+  }
+  return {
+    id: String(entry.id ?? "").trim() || newPresetId(),
+    label,
+    style: style || label,
+    // Presets have always been sent as exact words; anything without an
+    // opinion keeps that behaviour.
+    raw: entry.raw !== false,
+    tuning
+  };
+}
+
+/** A short button label taken from the first phrase of a style prompt. */
+function labelFromStyle(style) {
+  const first = String(style ?? "").split(/[,;\n]/)[0].trim();
+  return first.split(/\s+/).slice(0, 3).join(" ").slice(0, 24);
+}
+
+function getPresets() {
+  let stored = setting("presetList");
+  if (!Array.isArray(stored)) stored = [];
+  // An empty list means "the GM deleted them all" once the world has been
+  // migrated, and "1.1 never wrote this setting" before that -- so only fall
+  // back to the old text setting while the migration has not run.
+  if (!stored.length && !setting("presetsMigrated")) {
+    stored = parseLegacyPresets(setting("presets"));
+  }
+  return stored.map(normalizePreset).filter(Boolean);
+}
+
+/** Write the list back. World-scoped, so this is a GM-only operation. */
+async function savePresets(list) {
+  if (!game.user.isGM) {
+    throw new MusicError("Only the GM can change the preset list.",
+      "Presets are shared by the whole table, so they live in the world settings.");
+  }
+  const clean = (list ?? []).map(normalizePreset).filter(Boolean);
+  await game.settings.set(MODULE_ID, "presetList", clean);
+  return clean;
+}
+
+/**
+ * Move an existing world off the 1.1 text setting, once, so its presets show
+ * up in the manager instead of being silently replaced by the defaults.
+ */
+async function migratePresets() {
+  if (!game.user.isGM || setting("presetsMigrated")) return;
+
+  const legacy = (setting("presets") ?? "").trim();
+  const customised = legacy && legacy !== LEGACY_DEFAULT_PRESETS.trim();
+  const source = customised ? parseLegacyPresets(legacy) : DEFAULT_PRESETS;
+  if (customised) log(`migrating ${source.length} preset(s) from the 1.1 text setting`);
+
+  await savePresets(source);
+  await game.settings.set(MODULE_ID, "presetsMigrated", true);
+}
+
+/** Only the knobs this preset actually pins, ready to POST. */
+function presetTuning(preset) {
+  const tuning = {};
+  for (const key of TUNING_KEYS) {
+    if (Number.isFinite(preset?.tuning?.[key])) tuning[key] = preset.tuning[key];
+  }
+  return tuning;
+}
+
+function tuningSummary(tuning) {
+  return TUNING_KEYS
+    .filter(key => Number.isFinite(tuning?.[key]))
+    .map(key => `${key} ${tuning[key]}${TUNING_FIELDS[key].unit}`)
+    .join(" · ");
+}
+
+/** What a preset button's tooltip says: the words, and how they will be sent. */
+function presetTooltip(preset) {
+  const knobs = tuningSummary(preset.tuning);
+  return preset.style
+    + (preset.raw ? "" : " · rewritten by the AI first")
+    + (knobs ? ` · ${knobs}` : "");
+}
+
+/** Find a preset by what someone typed, forgivingly. */
+function findPreset(name) {
+  const wanted = String(name ?? "").trim().toLowerCase();
+  if (!wanted) return null;
+  const presets = getPresets();
+  return presets.find(p => p.label.toLowerCase() === wanted)
+    ?? presets.find(p => p.label.toLowerCase().startsWith(wanted))
+    ?? presets.find(p => p.label.toLowerCase().includes(wanted))
+    ?? presets.find(p => isOneEditApart(wanted, p.label.toLowerCase()))
+    ?? null;
+}
+
+/** Play a preset: its words, its rewrite setting, and its pinned knobs. */
+function applyPreset(preset, { announce = true } = {}) {
+  return steer(preset.style, {
+    raw: preset.raw,
+    tuning: presetTuning(preset),
+    announce
+  });
+}
+
+/** The live state of the server as a preset would store it. */
+function liveAsPreset() {
+  if (!status) {
+    throw new MusicError("The music server has not reported what it is playing.",
+      "Presets can only capture live settings while the server is reachable — "
+      + "press Diagnose to find out why it is not.");
+  }
+  const tuning = {};
+  for (const key of TUNING_KEYS) {
+    const value = Number(status[key]);
+    if (Number.isFinite(value)) tuning[key] = value;
+  }
+  return {
+    id: newPresetId(),
+    label: labelFromStyle(status.prompt),
+    // Whatever is playing is already a style prompt — rewriting it again would
+    // drift away from the thing being captured.
+    raw: true,
+    style: String(status.prompt ?? "").trim(),
+    tuning
+  };
+}
+
+/* -------------------------------------------------------- sidebar panel */
 
 /** The Playlists tab is where a listener looks for a transport, so build one. */
 function panelHTML() {
@@ -835,9 +1028,22 @@ function panelHTML() {
       <button type="button" class="mm-diagnose" data-mm="diagnose">Diagnose</button>
     </div>` : "";
 
-  const presets = parsePresets().map((p, i) =>
-    `<button type="button" class="mm-preset" data-mm="preset" data-index="${i}"
-             data-tooltip="${esc(p.style)}">${esc(p.label)}</button>`).join("");
+  // The preset row doubles as the way into the manager: a GM tweaking the
+  // music live is exactly the person who wants to keep what they just made.
+  const presetList = getPresets();
+  const presets = presetList.map(p =>
+    `<button type="button" class="mm-preset" data-mm="preset" data-id="${esc(p.id)}"
+             data-tooltip="${esc(presetTooltip(p))}">${esc(p.label)}</button>`).join("");
+  const presetTools = isGM ? `
+    <button type="button" class="mm-preset mm-preset-tool" data-mm="preset-capture"
+            data-tooltip aria-label="Save what is playing now as a preset"
+            ${status ? "" : "disabled"}><i class="fa-solid fa-plus" inert></i></button>
+    <button type="button" class="mm-preset mm-preset-tool" data-mm="preset-edit"
+            data-tooltip aria-label="Add, edit and test presets"
+            ><i class="fa-solid fa-sliders" inert></i></button>` : "";
+  const presetRow = (presets || presetTools)
+    ? `<div class="mm-presets">${presets}${presetTools}</div>`
+    : "";
 
   const advanced = status ? `
     <details class="mm-advanced" ${draft.advanced ? "open" : ""}>
@@ -893,7 +1099,7 @@ function panelHTML() {
   </div>
   <label class="mm-raw"><input type="checkbox" data-mm="raw" ${draft.raw ? "checked" : ""}>
     exact words (skip the AI rewrite)</label>
-  <div class="mm-presets">${presets}</div>
+  ${presetRow}
   ${advanced}` : ""}`;
 }
 
@@ -921,7 +1127,7 @@ function updatePanel() {
   const key = active?.dataset?.mm
     ? `[data-mm="${active.dataset.mm}"]${active.dataset.key ? `[data-key="${active.dataset.key}"]` : ""}`
     : active?.className ? `.${active.className.split(/\s+/)[0]}` : null;
-  const caret = active?.selectionStart ?? null;
+  const caret = caretOf(active);
   if (active?.classList.contains("mm-prompt")) draft.text = active.value;
   draft.advanced = panel.querySelector(".mm-advanced")?.open ?? draft.advanced;
 
@@ -985,9 +1191,19 @@ function onPanelClick(event) {
   }
   if (action === "preset") {
     event.preventDefault();
-    const preset = parsePresets()[Number(button.dataset.index)];
+    const preset = getPresets().find(p => p.id === button.dataset.id);
     if (!preset) return;
-    return guard(steer(preset.style, { raw: true }));
+    return guard(applyPreset(preset));
+  }
+  if (action === "preset-edit") {
+    event.preventDefault();
+    return guard(openPresetManager());
+  }
+  if (action === "preset-capture") {
+    event.preventDefault();
+    // Opens the manager on a new preset holding whatever is playing, rather
+    // than saving it silently: it still wants a name, and probably a listen.
+    return guard(openPresetManager({ captureLive: true }));
   }
 }
 
@@ -1094,6 +1310,533 @@ function ensureStatusPolling() {
   }, STATUS_POLL_MS);
 }
 
+/* -------------------------------------------------------- preset manager */
+
+/**
+ * The preset editor: add, edit, reorder, test, and capture presets in one
+ * window.
+ *
+ * Two things shape it. First, a preset is only as good as it sounds, and the
+ * only way to know how it sounds is to play it — so every row has a Test
+ * button that sends the row *as currently typed*, before anything is saved,
+ * and an Undo that puts the table back where it was. Second, the best presets
+ * are usually discovered rather than written: you steer the music by hand
+ * until it is right, and then want to keep it. That is what the capture
+ * buttons are for, on the row and on the sidebar panel both.
+ *
+ * Nothing is written to the world until Save, so testing and tweaking are free.
+ *
+ * The class is built at init because it extends a Foundry base class that does
+ * not exist when this file is first evaluated. ApplicationV2 is used where it
+ * exists (v12+) and FormApplication is the fallback; both share every method
+ * below, and differ only in how a window gets on screen.
+ */
+const PRESET_MANAGER_METHODS = {
+
+  /** Take a working copy of the saved presets. Edits stay here until Save. */
+  prepareState() {
+    if (!this.presets) {
+      this.presets = getPresets();
+      this.results = {};    // id -> what the server made of a tested preset
+      this.baseline = null; // what was playing before the first test
+      this.dirty = false;
+    }
+    if (this.pendingCapture) {
+      this.pendingCapture = false;
+      // Best-effort: if the server has not answered yet the row is still added,
+      // just empty, and the row's own capture button can fill it in later.
+      try { this.presets.push(liveAsPreset()); this.dirty = true; }
+      catch (err) { reportError(err, { context: "capture live preset" }); }
+    }
+  },
+
+  buildHTML() {
+    const rows = this.presets.map((p, i) => this.rowHTML(p, i)).join("");
+    const empty = this.presets.length ? "" : `
+      <li class="mm-pm-empty">No presets yet. <b>Add preset</b> writes one from
+      scratch; <b>Add what is playing</b> keeps the style the server is on
+      right now.</li>`;
+
+    return `
+    <div class="mm-pm">
+      <p class="mm-pm-intro">
+        These are the buttons in the Music sidebar tab. <b>Test</b> plays a row
+        as it is typed, without saving it — nothing here reaches the table's
+        settings until you press <b>Save presets</b>.
+      </p>
+      <ol class="mm-pm-list">${rows}${empty}</ol>
+      <footer class="mm-pm-footer">
+        <div class="mm-pm-live">${this.liveHTML()}</div>
+        <div class="mm-pm-actions">
+          <button type="button" data-pm="add">
+            <i class="fa-solid fa-plus" inert></i> Add preset</button>
+          <button type="button" data-pm="add-live">
+            <i class="fa-solid fa-tower-broadcast" inert></i> Add what is playing</button>
+          <button type="button" data-pm="defaults">
+            <i class="fa-solid fa-rotate-left" inert></i> Restore defaults</button>
+        </div>
+        <div class="mm-pm-commit">
+          <button type="button" data-pm="cancel">Discard changes</button>
+          <button type="button" data-pm="save" class="mm-pm-save">
+            <i class="fa-solid fa-floppy-disk" inert></i> Save presets</button>
+        </div>
+      </footer>
+    </div>`;
+  },
+
+  /** The live-server line, and the Undo that exists once something was tested. */
+  liveHTML() {
+    const undo = this.baseline ? `
+      <button type="button" class="mm-pm-undo" data-pm="undo"
+              data-tooltip="Put the table back on what it was playing before you started testing">
+        <i class="fa-solid fa-arrow-rotate-left" inert></i> Undo testing</button>` : "";
+    const now = status
+      ? `Now playing: <i>${esc(status.prompt)}</i>`
+        + (tuningSummary(status) ? ` &middot; ${esc(tuningSummary(status))}` : "")
+      : "The music server is not answering, so testing and capturing are unavailable.";
+    return `<span class="mm-pm-now ellipsis">${now}</span>${undo}`;
+  },
+
+  rowHTML(preset, index) {
+    const last = index === this.presets.length - 1;
+    const knobs = TUNING_KEYS.map(key => {
+      const field = TUNING_FIELDS[key];
+      const value = Number.isFinite(preset.tuning?.[key]) ? preset.tuning[key] : "";
+      return `
+        <label class="mm-pm-knob" data-tooltip="${esc(field.hint)}">
+          <span>${field.label}</span>
+          <input type="number" data-field="tuning.${key}" value="${value}"
+                 min="${field.min}" max="${field.max}" step="${field.step}"
+                 placeholder="—">
+        </label>`;
+    }).join("");
+
+    const pinned = tuningSummary(preset.tuning);
+    const result = this.results[preset.id];
+    const resultHTML = result ? `
+      <div class="mm-pm-result">
+        <i class="fa-solid fa-check" inert></i>
+        <span>Playing now${result.style && result.style !== preset.style
+          ? `, rewritten to <i>${esc(result.style)}</i>` : ""}.</span>
+        ${result.style && result.style !== preset.style ? `
+        <button type="button" data-pm="use-result"
+                data-tooltip="Store the rewritten words instead, so this preset always sounds like this">
+          Keep the rewrite</button>` : ""}
+      </div>` : "";
+
+    return `
+    <li class="mm-pm-row" data-id="${esc(preset.id)}">
+      <div class="mm-pm-order">
+        <button type="button" data-pm="up" data-tooltip aria-label="Move up"
+                ${index === 0 ? "disabled" : ""}>
+          <i class="fa-solid fa-chevron-up" inert></i></button>
+        <span class="mm-pm-index">${index + 1}</span>
+        <button type="button" data-pm="down" data-tooltip aria-label="Move down"
+                ${last ? "disabled" : ""}>
+          <i class="fa-solid fa-chevron-down" inert></i></button>
+      </div>
+
+      <div class="mm-pm-fields">
+        <div class="mm-pm-line">
+          <input type="text" class="mm-pm-label" data-field="label"
+                 value="${esc(preset.label)}" placeholder="Button label">
+          <button type="button" class="mm-pm-test" data-pm="test" ${status ? "" : "disabled"}
+                  data-tooltip="Play this row now, exactly as it is typed">
+            <i class="fa-solid fa-play" inert></i> Test</button>
+          <button type="button" data-pm="capture" ${status ? "" : "disabled"}
+                  data-tooltip="Overwrite this preset with what is playing right now">
+            <i class="fa-solid fa-tower-broadcast" inert></i></button>
+          <button type="button" data-pm="duplicate" data-tooltip aria-label="Duplicate">
+            <i class="fa-solid fa-copy" inert></i></button>
+          <button type="button" data-pm="delete" class="mm-pm-delete"
+                  data-tooltip aria-label="Delete">
+            <i class="fa-solid fa-trash" inert></i></button>
+        </div>
+
+        <textarea class="mm-pm-style" data-field="style" rows="2"
+          placeholder="instruments, mood, tempo — what the music should be">${esc(preset.style)}</textarea>
+
+        <label class="mm-pm-raw"
+               data-tooltip="On: these exact words go to the music model. Off: the LLM rewrites them first, which suits a description of a scene rather than of a sound.">
+          <input type="checkbox" data-field="raw" ${preset.raw ? "checked" : ""}>
+          exact words (skip the AI rewrite)</label>
+
+        <details class="mm-pm-tuning" ${pinned ? "open" : ""}>
+          <summary>Generation settings${pinned ? ` — ${esc(pinned)}` : " — leave unchanged"}</summary>
+          <div class="mm-pm-knobs">${knobs}</div>
+          <div class="mm-pm-knob-actions">
+            <button type="button" data-pm="capture-tuning" ${status ? "" : "disabled"}>
+              Use what is playing</button>
+            <button type="button" data-pm="clear-tuning">Leave unchanged</button>
+            <span class="mm-pm-note">Blank means the preset does not touch that knob.</span>
+          </div>
+        </details>
+
+        ${resultHTML}
+      </div>
+    </li>`;
+  },
+
+  /* --------------------------------------------------------------- wiring */
+
+  attach(root) {
+    this.root = root;
+    // A second render reuses the same content element under ApplicationV2, so
+    // binding again there would run every click handler twice.
+    if (this.boundRoot !== root) {
+      this.boundRoot = root;
+      root.addEventListener("click", this.onClick.bind(this));
+      root.addEventListener("input", this.onEdit.bind(this));
+      root.addEventListener("change", this.onEdit.bind(this));
+    }
+    // The window may have been opened from a cold sidebar, in which case the
+    // knob values and the "now playing" line have nothing behind them yet.
+    if (!status) fetchStatus().then(() => this.refresh()).catch(() => this.refresh());
+  },
+
+  /**
+   * Redraw the list in place. Field edits go straight into this.presets, so
+   * the DOM is disposable -- but the caret is not, and a redraw lands under
+   * whatever the user was typing in.
+   */
+  refresh() {
+    if (!this.root?.isConnected) return;
+    const active = document.activeElement;
+    const inside = this.root.contains(active);
+    const rowId = inside ? active.closest?.(".mm-pm-row")?.dataset?.id : null;
+    const field = inside ? active.dataset?.field : null;
+    const caret = inside ? caretOf(active) : null;
+    const scroll = this.root.querySelector(".mm-pm-list")?.scrollTop ?? 0;
+
+    this.root.innerHTML = this.buildHTML();
+
+    const list = this.root.querySelector(".mm-pm-list");
+    if (list) list.scrollTop = scroll;
+    if (!field) return;
+    const selector = rowId
+      ? `.mm-pm-row[data-id="${rowId}"] [data-field="${field}"]`
+      : `[data-field="${field}"]`;
+    const restored = this.root.querySelector(selector);
+    if (!restored) return;
+    restored.focus({ preventScroll: true });
+    if (caret !== null && restored.setSelectionRange) {
+      try { restored.setSelectionRange(caret, caret); } catch (err) { /* not text */ }
+    }
+  },
+
+  /** Only the footer, for changes that must not disturb an open text box. */
+  refreshLive() {
+    const live = this.root?.querySelector(".mm-pm-live");
+    if (live) live.innerHTML = this.liveHTML();
+  },
+
+  presetAt(element) {
+    const id = element?.closest?.(".mm-pm-row")?.dataset?.id;
+    const index = this.presets.findIndex(p => p.id === id);
+    return { index, preset: this.presets[index] };
+  },
+
+  onEdit(event) {
+    const target = event.target;
+    const field = target.dataset?.field;
+    if (!field) return;
+    const { preset } = this.presetAt(target);
+    if (!preset) return;
+    this.dirty = true;
+
+    if (field.startsWith("tuning.")) {
+      const key = field.slice("tuning.".length);
+      const value = Number(target.value);
+      // An emptied box means "do not touch this knob", which is not the same
+      // as zero -- morph 0 and morph untouched are different presets.
+      if (target.value === "" || !Number.isFinite(value)) delete preset.tuning[key];
+      else preset.tuning[key] = value;
+      // Only on commit: retitling the fold mid-keystroke would fight the caret.
+      if (event.type === "change") this.refresh();
+      return;
+    }
+    if (field === "raw") return void (preset.raw = target.checked);
+    preset[field] = target.value;
+    // The label appears in nothing else on screen, so there is nothing to
+    // redraw for it -- the working copy is already up to date.
+  },
+
+  onClick(event) {
+    const button = event.target.closest("[data-pm]");
+    if (!button || button.disabled) return;
+    event.preventDefault();
+    const action = button.dataset.pm;
+    const { index, preset } = this.presetAt(button);
+    const guard = (promise) => Promise.resolve(promise)
+      .catch(err => reportError(err, { context: `presets: ${action}` }));
+
+    switch (action) {
+      case "add": {
+        // Built by hand rather than normalized: an empty preset is not a valid
+        // one, and normalizePreset would refuse it. It becomes valid as it is
+        // typed, and commit() drops it if it never does.
+        this.presets.push({ id: newPresetId(), label: "", style: "", raw: true, tuning: {} });
+        this.dirty = true;
+        this.refresh();
+        // A new row is worth nothing until it is named, so start there.
+        const rows = this.root.querySelectorAll(".mm-pm-row");
+        rows[rows.length - 1]?.querySelector(".mm-pm-label")?.focus();
+        return;
+      }
+      case "add-live":
+        return guard(this.captureInto(null));
+      case "capture":
+        return guard(this.captureInto(preset));
+      case "capture-tuning":
+        return guard(this.captureInto(preset, { tuningOnly: true }));
+      case "clear-tuning":
+        preset.tuning = {};
+        this.dirty = true;
+        return this.refresh();
+      case "duplicate":
+        this.presets.splice(index + 1, 0,
+          normalizePreset({ ...preset, id: "", label: `${preset.label} copy` }));
+        this.dirty = true;
+        return this.refresh();
+      case "delete":
+        this.presets.splice(index, 1);
+        delete this.results[preset.id];
+        this.dirty = true;
+        return this.refresh();
+      case "up":
+      case "down": {
+        const to = action === "up" ? index - 1 : index + 1;
+        if (to < 0 || to >= this.presets.length) return;
+        this.presets.splice(to, 0, this.presets.splice(index, 1)[0]);
+        this.dirty = true;
+        return this.refresh();
+      }
+      case "test":
+        return guard(this.test(preset));
+      case "undo":
+        return guard(this.undoTesting());
+      case "use-result": {
+        const result = this.results[preset.id];
+        if (!result?.style) return;
+        preset.style = result.style;
+        preset.raw = true;   // it is a style prompt now; rewriting it again drifts
+        delete this.results[preset.id];
+        this.dirty = true;
+        return this.refresh();
+      }
+      case "defaults":
+        return guard(this.restoreDefaults());
+      case "save":
+        return guard(this.commit());
+      case "cancel":
+        return this.close();
+    }
+  },
+
+  /* -------------------------------------------------------------- actions */
+
+  /**
+   * Copy the live server state into a preset, or into a new one when `preset`
+   * is null. Status is refreshed first: capturing knobs that are one poll out
+   * of date would silently store the wrong numbers.
+   */
+  async captureInto(preset, { tuningOnly = false } = {}) {
+    await fetchStatus();
+    const live = liveAsPreset();
+    if (!preset) {
+      this.presets.push(live);
+    } else if (tuningOnly) {
+      preset.tuning = live.tuning;
+    } else {
+      preset.style = live.style;
+      preset.raw = true;
+      preset.tuning = live.tuning;
+      if (!preset.label.trim()) preset.label = live.label;
+    }
+    this.dirty = true;
+    this.refresh();
+  },
+
+  /**
+   * Play a row as typed. The table hears it -- there is no private audition of
+   * a shared stream -- so the state it replaces is remembered for Undo.
+   */
+  async test(preset) {
+    if (!this.baseline) {
+      await fetchStatus();
+      this.baseline = liveAsPreset();
+    }
+    const candidate = normalizePreset(preset);
+    if (!candidate?.style.trim()) {
+      throw new MusicError("This preset has no words to play.",
+        "Describe the music in the box under the label, then test it again.");
+    }
+    const data = await applyPreset(candidate, { announce: false });
+    this.results = { [preset.id]: { style: data.style ?? candidate.style } };
+    this.refresh();
+  },
+
+  /** Put the table back on whatever was playing before the first test. */
+  async undoTesting() {
+    const baseline = this.baseline;
+    if (!baseline) return;
+    await applyPreset(baseline, { announce: false });
+    this.baseline = null;
+    this.results = {};
+    this.refresh();
+  },
+
+  async restoreDefaults() {
+    const ok = await confirmAction(
+      "Replace the preset list with the six that ship with the module? "
+      + "Nothing is written until you press Save presets.");
+    if (!ok) return;
+    this.presets = DEFAULT_PRESETS.map(normalizePreset);
+    this.results = {};
+    this.dirty = true;
+    this.refresh();
+  },
+
+  /** Validate, write to the world setting, and close. */
+  async commit() {
+    const usable = this.presets.filter(p => p.label.trim() || p.style.trim());
+    const unnamed = usable.filter(p => !p.style.trim());
+    if (unnamed.length) {
+      throw new MusicError(
+        `"${unnamed[0].label.trim() || "A preset"}" has a label but no music.`,
+        "Every preset needs words to send. Fill the box in, or delete the row.");
+    }
+    const saved = await savePresets(usable);
+    this.dirty = false;
+    ui.notifications?.info(
+      `Live Music: saved ${saved.length} preset${saved.length === 1 ? "" : "s"}.`);
+    updatePanel();
+    this.close();
+  }
+};
+
+/** Dialog confirmation, across the v12/v13 application rewrite. */
+async function confirmAction(content) {
+  const DialogV2 = foundry.applications?.api?.DialogV2;
+  if (DialogV2?.confirm) {
+    return DialogV2.confirm({
+      window: { title: "Live Music presets" },
+      content: `<p>${esc(content)}</p>`,
+      modal: true
+    });
+  }
+  if (globalThis.Dialog?.confirm) {
+    return Dialog.confirm({ title: "Live Music presets", content: `<p>${esc(content)}</p>` });
+  }
+  return window.confirm(content);
+}
+
+/**
+ * Build the manager class against whichever application base this Foundry has.
+ * Called once, at init, because neither base class exists before then.
+ */
+function buildPresetManagerClass() {
+  const ApplicationV2 = foundry.applications?.api?.ApplicationV2;
+  const shared = {
+    id: "magenta-music-presets",
+    classes: ["magenta-music-presets"],
+    title: "Live Music presets",
+    width: 640,
+    height: 700
+  };
+
+  if (ApplicationV2) {
+    class PresetManagerV2 extends ApplicationV2 {
+      static DEFAULT_OPTIONS = {
+        id: shared.id,
+        classes: shared.classes,
+        window: { title: shared.title, icon: "fa-solid fa-sliders", resizable: true },
+        position: { width: shared.width, height: shared.height }
+      };
+
+      async _renderHTML() {
+        this.prepareState();
+        return this.buildHTML();
+      }
+
+      _replaceHTML(result, content) {
+        content.innerHTML = result;
+        this.attach(content);
+      }
+    }
+    Object.assign(PresetManagerV2.prototype, PRESET_MANAGER_METHODS);
+    return PresetManagerV2;
+  }
+
+  // v12 and earlier: same methods, older window. _renderInner is overridden so
+  // no Handlebars template file is needed for HTML we already have as a string.
+  class PresetManagerV1 extends FormApplication {
+    static get defaultOptions() {
+      return foundry.utils.mergeObject(super.defaultOptions, {
+        ...shared,
+        resizable: true,
+        closeOnSubmit: false,
+        submitOnChange: false,
+        submitOnClose: false
+      });
+    }
+
+    async _renderInner() {
+      this.prepareState();
+      return $(`<div class="mm-pm-wrap">${this.buildHTML()}</div>`);
+    }
+
+    activateListeners(html) {
+      super.activateListeners(html);
+      this.attach(html[0] ?? html);
+    }
+
+    async _updateObject() { /* saving is the Save button's job, not the form's */ }
+  }
+  Object.assign(PresetManagerV1.prototype, PRESET_MANAGER_METHODS);
+  return PresetManagerV1;
+}
+
+/**
+ * The class registerMenu instantiates. It exists only to satisfy the "a
+ * settings menu is an Application subclass" contract and then hand off to the
+ * one shared manager window -- constructing a second window with the same id
+ * would fight the first one for it.
+ */
+function buildPresetMenuClass() {
+  const Base = foundry.applications?.api?.ApplicationV2 ?? FormApplication;
+  return class PresetSettingsMenu extends Base {
+    render() {
+      openPresetManager();
+      return this;
+    }
+  };
+}
+
+/**
+ * Open the manager, optionally starting with a new preset holding whatever is
+ * playing right now.
+ */
+function openPresetManager({ captureLive = false } = {}) {
+  if (!game.user.isGM) {
+    throw new MusicError("Only the GM can edit the preset list.",
+      "Presets are shared by the whole table. Ask your GM to add one, or use "
+      + "the prompt box to change the music just this once.");
+  }
+  PresetManagerClass ??= buildPresetManagerClass();
+  presetManager ??= new PresetManagerClass();
+  // Reopening starts from what is saved; an abandoned session should not come
+  // back as a surprise pile of edits.
+  if (!presetManager.rendered) {
+    presetManager.presets = null;
+    presetManager.pendingCapture = captureLive;
+  } else if (captureLive) {
+    presetManager.captureInto(null).catch(err =>
+      reportError(err, { context: "capture live preset" }));
+  }
+  return presetManager.render(true);
+}
+
 /* --------------------------------------------------------------- commands */
 
 const COMMAND_HELP =
@@ -1108,10 +1851,13 @@ const COMMAND_HELP =
   `<b>/music morph 3</b> — cross-fade seconds.<br>` +
   `<b>/music temp 1.2</b> / <b>cfg 3</b> / <b>topk 40</b> — generation knobs.<br>` +
   `<b>/music llm on|off</b> — prompt rewriting.<br>` +
-  `<b>/music presets</b> — list the configured presets.</p>`;
+  `<b>/music preset &lt;name&gt;</b> — play a saved preset.<br>` +
+  `<b>/music presets</b> — list them. <b>/music presets edit</b> — add, test and adjust them (GM).<br>` +
+  `<b>/music preset save &lt;name&gt;</b> — keep what is playing now as a preset (GM).</p>`;
 
 const COMMANDS = ["help", "status", "diagnose", "play", "pause", "stop", "resume",
-  "on", "off", "sync", "presets", "volume", "morph", "temp", "topk", "cfg", "llm", "raw"];
+  "on", "off", "sync", "preset", "presets", "volume", "morph", "temp",
+  "topk", "cfg", "llm", "raw"];
 
 const KNOB_EXAMPLES = { morph: "3", temp: "1.2", topk: "40", cfg: "3" };
 
@@ -1165,15 +1911,53 @@ async function handleMusicCommand(argument) {
       return postLocal(`<p>Skipped ${lag.toFixed(1)}s of buffered delay.</p>`);
     }
 
-    if (arg === "presets") {
-      const presets = parsePresets();
+    // "/music preset tavern", "/music presets", "/music presets edit",
+    // "/music preset save Ambush". Saving is namespaced under "preset" rather
+    // than being its own verb because "/music save the village from the fire"
+    // is a scene somebody will type, and it must stay a scene.
+    const preset = arg.match(/^presets?\b\s*(.*)$/i);
+    if (preset) {
+      const rest = preset[1].trim();
+      if (/^(edit|manage|add|new)$/i.test(rest)) return openPresetManager();
+
+      const saving = rest.match(/^(?:save|keep)\b\s*(.*)$/i);
+      if (saving) {
+        const name = saving[1].trim();
+        if (!name) {
+          throw new MusicError("/music preset save needs a name.",
+            "For example: /music preset save Ambush. It keeps whatever is "
+            + "playing right now, knobs and all.");
+        }
+        await fetchStatus();
+        const captured = normalizePreset({ ...liveAsPreset(), label: name });
+        await savePresets([...getPresets(), captured]);
+        updatePanel();
+        return postLocal(`<p>Saved <b>${esc(captured.label)}</b> — `
+          + `<i>${esc(captured.style)}</i></p>`);
+      }
+
+      const presets = getPresets();
       if (!presets.length) {
         throw new MusicError("No presets are configured.",
-          "The GM can add them in Module Settings → Preset buttons, one per "
-          + "line as \"Label | style prompt\".");
+          game.user.isGM
+            ? "Add some with /music presets edit, or from the sliders button in "
+              + "the Music sidebar tab."
+            : "Ask your GM to add some in the Music sidebar tab.");
       }
-      return postLocal(`<p>${presets.map(p =>
-        `<b>${esc(p.label)}</b> — ${esc(p.style)}`).join("<br>")}</p>`);
+      if (!rest) {
+        return postLocal(`<p>${presets.map(p =>
+          `<b>${esc(p.label)}</b> — ${esc(p.style)}`
+          + (p.raw ? "" : " <i>(rewritten)</i>")
+          + (tuningSummary(p.tuning) ? ` <i>${esc(tuningSummary(p.tuning))}</i>` : "")
+        ).join("<br>")}</p>`
+          + (game.user.isGM ? `<p><i>/music presets edit</i> to change them.</p>` : ""));
+      }
+      const wanted = findPreset(rest);
+      if (!wanted) {
+        throw new MusicError(`There is no preset called "${rest}".`,
+          `Try one of: ${presets.map(p => p.label).join(", ")}.`);
+      }
+      return applyPreset(wanted);
     }
 
     if (arg === "status") {
@@ -1339,15 +2123,45 @@ Hooks.once("init", () => {
     default: true
   });
 
-  game.settings.register(MODULE_ID, "presets", {
-    name: "Preset buttons",
-    hint: "One per line, as \"Label | style prompt\". These appear as buttons " +
-          "in the Music sidebar tab and are sent as exact words, no rewrite.",
+  // The presets themselves. Edited through the manager below rather than in
+  // the settings form: a preset is a label, some words, a rewrite choice and
+  // up to four knobs, and it is worth testing before it is kept.
+  game.settings.register(MODULE_ID, "presetList", {
     scope: "world",
-    config: true,
+    config: false,
+    type: Array,
+    default: [],
+    onChange: () => { updatePanel(); presetManager?.refreshLive?.(); }
+  });
+
+  // Set once the list above holds the truth; until then an empty list means
+  // "not yet migrated" rather than "deliberately empty".
+  game.settings.register(MODULE_ID, "presetsMigrated", {
+    scope: "world",
+    config: false,
+    type: Boolean,
+    default: false
+  });
+
+  // Pre-1.2 storage: "Label | style" lines. Read only until migratePresets()
+  // has moved a world across, and kept afterwards so nothing is thrown away.
+  game.settings.register(MODULE_ID, "presets", {
+    scope: "world",
+    config: false,
     type: String,
-    default: DEFAULT_PRESETS,
+    default: LEGACY_DEFAULT_PRESETS,
     onChange: () => updatePanel()
+  });
+
+  game.settings.registerMenu(MODULE_ID, "presetManager", {
+    name: "Preset buttons",
+    label: "Add, test and adjust presets",
+    hint: "The buttons in the Music sidebar tab: a label, the music it plays, " +
+          "and optional generation settings. Each one can be tested from the " +
+          "editor before it is saved.",
+    icon: "fa-solid fa-sliders",
+    type: buildPresetMenuClass(),
+    restricted: true
   });
 
   // Table-wide transport state. World-scoped so a GM pressing stop stops the
@@ -1426,6 +2240,10 @@ Hooks.once("ready", () => {
   });
 
   refreshPlaybackState();
+
+  // Presets moved from a text setting to structured data in 1.2; carry an
+  // existing world's list across before anything reads it.
+  migratePresets().catch(err => log("preset migration skipped:", err?.message ?? err));
 
   // Foundry builds its audio buses on the first user gesture. If we started
   // before that happened we are playing direct, and the core Music slider is

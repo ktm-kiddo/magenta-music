@@ -161,10 +161,47 @@ The module adds a **Live Music** panel to the top of Foundry's Playlists
   to silence themselves without stopping everyone.
 - **Jump to live** skips whatever delay your browser has accumulated.
 - **Volume**, on top of Foundry's own global Music slider.
-- **A prompt box and preset buttons** for anyone allowed to steer.
+- **A prompt box and preset buttons** for anyone allowed to steer. Next to the
+  presets a GM gets two more: **＋** keeps what is playing right now as a new
+  preset, and the **sliders** open the preset editor.
 - **Generation settings** — cross-fade, temperature, style strength — under a
   fold, applied to the server for everyone.
 - **Errors, in place**, with a *Diagnose* button when something is wrong.
+
+### Presets
+
+A preset is one button: a label, the music it plays, whether the AI rewrites it
+first, and optionally the generation knobs it pins. Open the editor from the
+sliders button in the Music tab, from *Configure Settings → Module Settings →
+Preset buttons*, or with `/music presets edit`.
+
+In it, every row has:
+
+- **Test**, which plays that row *as currently typed* — before it is saved — so
+  you can hear a preset while writing it. Testing changes what the table hears,
+  because there is only one stream; **Undo testing** in the footer puts the
+  music back on whatever was playing before the first test.
+- **Keep the rewrite**, offered after testing a row that is not "exact words".
+  The LLM's version of your description becomes the preset's stored words, so
+  the button sounds the same every time instead of being re-improvised.
+- **A broadcast button**, which overwrites the row with what is playing now.
+- **Generation settings**, blank by default. A number pins that knob whenever
+  the preset is used — a Combat preset can carry a short cross-fade and a high
+  style strength, and a Travel preset can leave both alone.
+- Duplicate, delete, and arrows to order them.
+
+Nothing is written to the world until **Save presets**, so testing and tweaking
+cost nothing. The usual way to build a good preset is backwards: steer the music
+by hand until it sounds right, then press **＋** in the Music tab (or type
+`/music preset save Ambush`) to keep exactly that — style prompt, cross-fade,
+temperature and all.
+
+Presets are shared by the table, so only a GM can edit them; anyone allowed to
+steer can press the buttons.
+
+Worlds upgrading from 1.1 keep their presets: the old
+"`Label | style`"-per-line setting is converted to the new editor once, on
+first load.
 
 Because the stream is routed through Foundry's Music audio channel, the core
 Music volume slider governs it exactly as it governs a playlist track. If the
@@ -187,7 +224,10 @@ itself, which is a fallback you should never notice.
 | `/music morph 3` | Cross-fade seconds |
 | `/music temp 1.2` / `cfg 3` / `topk 40` | Generation knobs |
 | `/music llm on` / `off` | Prompt rewriting |
-| `/music presets` | List the configured presets |
+| `/music preset tavern` | Play a saved preset (matches on a prefix or a typo) |
+| `/music presets` | List them |
+| `/music presets edit` | Open the preset editor (GM) |
+| `/music preset save Ambush` | Keep what is playing now as a preset (GM) |
 | `/music` | Help |
 
 Who may steer is set under *Module Settings → Who can change the music*:

@@ -2,7 +2,7 @@
   "id": "magenta-music",
   "title": "Magenta Live Music",
   "description": "Live AI-generated soundtrack that plays like a streaming track in the Music tab. Type /music <what is happening> in chat, or steer it from the sidebar, and the score adapts for everyone at the table.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "compatibility": {
     "minimum": "12",
     "verified": "14"
@@ -23,6 +23,6 @@
   "readme": "https://github.com/ktm-kiddo/magenta-music/blob/main/foundry-module/README.md",
   "bugs": "https://github.com/ktm-kiddo/magenta-music/issues",
   "manifest": "https://raw.githubusercontent.com/ktm-kiddo/magenta-music/main/foundry-module/magenta-music/module.json",
-  "download": "https://github.com/ktm-kiddo/magenta-music/releases/download/v1.1.0/magenta-music.zip",
+  "download": "https://github.com/ktm-kiddo/magenta-music/releases/download/v1.2.0/magenta-music.zip",
   "flags": {}
 }

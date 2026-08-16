@@ -116,6 +116,17 @@
   border-radius: 3px;
 }
 
+/* The two GM tools sit with the presets but are not presets, so they are
+   square icon buttons rather than labelled ones. */
+.magenta-music-panel .mm-preset-tool {
+  padding: 1px 5px;
+  opacity: 0.7;
+}
+
+.magenta-music-panel .mm-preset-tool:hover:not(:disabled) {
+  opacity: 1;
+}
+
 .magenta-music-panel .mm-advanced summary {
   cursor: pointer;
   font-size: var(--font-size-11, 11px);
@@ -186,4 +197,242 @@
   line-height: 1.6;
   font-size: var(--font-size-11, 11px);
   border-radius: 3px;
+}
+
+/*
+ * The preset editor.
+ *
+ * It is a list that can grow past the window, above a footer that must stay
+ * reachable -- the Save button is the only thing that writes anything, so it
+ * never scrolls out of sight. Everything else borrows Foundry's own form
+ * styling so the window reads like the rest of the application.
+ */
+
+/* The list scrolls, the footer does not: the Save button is the only thing
+   that writes anything, so it stays on screen however long the list gets.
+   That needs a height to flex against all the way down from the window. */
+.magenta-music-presets .window-content,
+.magenta-music-presets .window-content > form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.magenta-music-presets .mm-pm,
+.magenta-music-presets .mm-pm-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  height: 100%;
+  min-height: 0;
+  font-size: var(--font-size-13, 13px);
+}
+
+.magenta-music-presets .mm-pm-intro {
+  margin: 0;
+  font-size: var(--font-size-12, 12px);
+  opacity: 0.8;
+}
+
+.magenta-music-presets .mm-pm-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0 4px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.magenta-music-presets .mm-pm-row {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px;
+  padding: 6px;
+  border: 1px solid var(--color-border-light-tertiary, rgba(120, 120, 120, 0.4));
+  border-radius: 4px;
+}
+
+.magenta-music-presets .mm-pm-empty {
+  padding: 10px;
+  text-align: center;
+  opacity: 0.75;
+}
+
+.magenta-music-presets .mm-pm-order {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.magenta-music-presets .mm-pm-order button {
+  width: 22px;
+  height: 18px;
+  padding: 0;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+
+.magenta-music-presets .mm-pm-index {
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.6;
+}
+
+.magenta-music-presets .mm-pm-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.magenta-music-presets .mm-pm-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.magenta-music-presets .mm-pm-label {
+  flex: 1;
+  min-width: 0;
+  font-weight: bold;
+}
+
+.magenta-music-presets .mm-pm-line button {
+  flex: 0 0 auto;
+  width: auto;
+  padding: 2px 8px;
+  line-height: 1.4;
+}
+
+.magenta-music-presets .mm-pm-delete:hover:not(:disabled) {
+  color: #d9645a;
+}
+
+.magenta-music-presets .mm-pm-style {
+  width: 100%;
+  min-height: 3.2em;
+  resize: vertical;
+  font-family: inherit;
+}
+
+.magenta-music-presets .mm-pm-raw {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.85;
+}
+
+.magenta-music-presets .mm-pm-tuning summary {
+  cursor: pointer;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.8;
+}
+
+.magenta-music-presets .mm-pm-knobs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(9em, 1fr));
+  gap: 4px 8px;
+  margin: 4px 0;
+}
+
+.magenta-music-presets .mm-pm-knob {
+  display: grid;
+  grid-template-columns: 1fr 4.5em;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-presets .mm-pm-knob-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.magenta-music-presets .mm-pm-knob-actions button {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  line-height: 1.5;
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-presets .mm-pm-note {
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.6;
+}
+
+/* What the server made of a tested preset -- the answer to "how does it
+   sound", and the offer to keep the rewrite that produced it. */
+.magenta-music-presets .mm-pm-result {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  padding: 3px 6px;
+  border-radius: 3px;
+  background: rgba(76, 175, 80, 0.12);
+  border: 1px solid rgba(76, 175, 80, 0.5);
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-presets .mm-pm-result > i {
+  color: #4caf50;
+}
+
+.magenta-music-presets .mm-pm-result button {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  line-height: 1.5;
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-presets .mm-pm-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--color-border-light-tertiary, rgba(120, 120, 120, 0.4));
+}
+
+.magenta-music-presets .mm-pm-live {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.85;
+}
+
+.magenta-music-presets .mm-pm-now {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.magenta-music-presets .mm-pm-undo {
+  width: auto;
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  line-height: 1.5;
+  font-size: var(--font-size-11, 11px);
+}
+
+.magenta-music-presets .mm-pm-actions,
+.magenta-music-presets .mm-pm-commit {
+  display: flex;
+  gap: 4px;
+}
+
+.magenta-music-presets .mm-pm-save {
+  font-weight: bold;
 }

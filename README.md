@@ -82,6 +82,8 @@ Then in Foundry, under *Module Settings*:
 Now anyone at the table can type `/music they enter the dungeon` in chat, or use
 the **Live Music** panel the module adds to Foundry's Music tab — play/pause for
 the whole table, volume, a prompt box, preset buttons, and the generation knobs.
+Presets are editable in place: steer the music until it sounds right, press **＋**
+to keep it as a button, and test or adjust the lot in the preset editor.
 The prompt you're left at is the same player console as solo mode, so you can
 also steer it from the terminal. Ctrl-C stops the server and the tunnel together.
 
