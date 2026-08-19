@@ -61,10 +61,10 @@ reach it, and prints what you need:
 
 ```
   Music server URL (paste into Foundry module settings):
-    https://cursor-cathedral-beliefs-potentially.trycloudflare.com
+    https://<random-words>.trycloudflare.com
 
   Music server token (paste into Foundry module settings):
-    3f9a1c7e5b2d8046a1f3c9e7b5d20486
+    <32 hex characters>
 
 Loading mrt2_small...
 Buffering 1.0s... playing.
@@ -99,6 +99,23 @@ Funnel](#getting-an-https-address) for a fixed hostname, and a fixed token.
 listen and change the music. That is fine on a LAN, but a `trycloudflare.com`
 address is on the open internet. The script warns you when it is missing.
 
+### Keeping the settings in `.env`
+
+`start.sh` reads `.env` as well as the environment, so the token and tunnel
+settings can live beside the API key and a session becomes plain `./start.sh`:
+
+```bash
+GROQ_API_KEY=gsk_...
+MUSIC_TOKEN=<a fixed secret>
+CF_TUNNEL_TOKEN=<named-tunnel token>    # optional, for a fixed hostname
+MUSIC_HOSTNAME=music.example.com        # required alongside CF_TUNNEL_TOKEN
+```
+
+The file is parsed rather than sourced — it is a place people paste secrets, not
+a script — and anything already set in the environment wins, so a one-off
+`MUSIC_TOKEN=… ./start.sh` still overrides what is in the file. `MUSIC_PORT`
+changes the port the server and the tunnel agree on, if 30001 is taken.
+
 ### Doing it without the wrapper
 
 Two terminals, which is all `start.sh` is doing:
@@ -126,8 +143,10 @@ broken is in Foundry's settings or the tunnel.
 listening through Foundry, otherwise you hear the same music twice, offset by
 the stream delay.
 
-Full Foundry setup — installing the module, the `/music` chat commands, hosting,
-tunnels — is in [foundry-module/README.md](foundry-module/README.md).
+Full Foundry setup — installing the module, its settings, the `/music` chat
+commands, presets, hosting and tunnels — is in
+[foundry-module/README.md](foundry-module/README.md). The module is at **1.3.0**,
+needs Foundry v12 or newer, and is verified against v14.
 
 ---
 
@@ -167,6 +186,8 @@ LLM to be rewritten into a style.
 | `they enter the dungeon` | LLM rewrites it into a style, music morphs to it |
 | `/raw dark ambient, low strings` | Uses your exact words, skips the rewrite |
 | `/llm on` / `/llm off` | Toggle prompt rewriting |
+| `/guidance keep it ambient` | Standing direction the rewriter follows on every line |
+| `/guidance` / `/guidance clear` | Show it / remove it |
 | `/morph 4` | Seconds to cross-fade between styles (default 1.6) |
 | `/status` | Buffer depth, playback speed, realtime factor, LLM quota |
 | `/save out.wav` | Write everything generated so far to a file |
@@ -184,6 +205,7 @@ Pressing Enter on an empty line does nothing — the music just keeps going.
 | Flag | Why you'd use it |
 |---|---|
 | `--serve` | Stream over HTTP so Foundry players can listen (port 30001) |
+| `--serve-port 30002` | Use a different port (`start.sh` uses `MUSIC_PORT`) |
 | `--no-local-audio` | Don't use your Mac's speakers |
 | `--serve-token SECRET` | Require a shared secret — **mandatory on a public tunnel** |
 | `--prompt "..."` | Set the opening style or scene |
@@ -191,6 +213,7 @@ Pressing Enter on an empty line does nothing — the music just keeps going.
 | `--backend jax` | Run on an NVIDIA GPU instead of Apple Silicon ([details](#running-the-model-on-a-remote-gpu)) |
 | `--serve-bitrate 96` | Lower MP3 bitrate if your upstream is tight |
 | `--no-llm` | Send your text straight to the music model, no rewriting |
+| `--guidance "..."` | Opening standing direction for the rewriter (see below) |
 | `--list-devices` | List audio outputs, for `--device` |
 | `--no-record` | Don't hold generated audio in memory (disables `/save`) |
 
@@ -231,6 +254,37 @@ second) to sit in a live loop.
 Everything degrades gracefully: no key, a network error, or a rate limit all
 fall back to sending your text to the music model unchanged. You'll see a
 warning line, and the music keeps playing.
+
+### Standing direction
+
+One line of scene text should not have to repeat how your table's music always
+sounds, or what a recurring name means. `--guidance`, or `/guidance` while it
+runs, adds that to the rewriter's system prompt for every line after it:
+
+```
+> /guidance keep it ambient and never overpowering; The Town is a small Spanish
+  coastal village
+  direction: keep it ambient and never overpowering; The Town is a small ...
+```
+
+It is folded in after the rules and marked as overriding the examples, so
+"keep it ambient" beats the few-shot turn whose answer is "aggressive
+orchestral metal". Blank lines are dropped, `<direction>` tags are stripped so
+the block cannot be closed early, and the whole thing is capped at 1500
+characters — past that it stops colouring the rules and starts drowning them.
+It never changes the output format, and it does nothing at all with `--no-llm`
+or without an API key, since there is no rewriter to direct.
+
+`/status` shows the current direction, and `GET /status` returns it as
+`guidance`.
+
+The GM normally writes it in Foundry instead — *Module Settings → Music
+direction*, or `/music direction ...` — which is the same field reached from
+the other end. The module sends it with **every** prompt, so restarting this
+process cannot leave the table on a direction nobody wrote any more, and
+`--guidance` is only the value in force until the first prompt arrives from
+Foundry. Set it here for a solo session at the console; set it there for a
+table.
 
 ### Setting the API key
 
@@ -506,6 +560,30 @@ cd /workspace/magenta-music
 MUSIC_TOKEN=$(openssl rand -hex 16) ./start.sh --backend jax
 ```
 
+### Skipping provisioning with a prebuilt image
+
+Provisioning from the script is several minutes of downloads on every fresh box.
+[`docker/`](docker/) builds a template image with the slow half — the CUDA
+wheels and the model weights — already inside, so a fresh instance costs an
+image pull instead of an install. The repo itself is *not* baked in: the image
+carries a small shim that clones or pulls it at boot and hands off to
+[docker/magenta-bootstrap.sh](docker/magenta-bootstrap.sh), so a code or
+boot-behaviour change costs a `git pull` rather than a multi-gigabyte rebuild.
+
+[`.github/workflows/image.yml`](.github/workflows/image.yml) builds it on a
+GitHub runner and pushes to GHCR (Actions → **template image** → Run workflow),
+which is worth doing rather than building at home: the image is 10–15 GB and the
+upload is the long pole. The template then points at
+`ghcr.io/<owner>/magenta-music:latest` with `magenta-bootstrap` as the on-start
+script, and with `MUSIC_AUTOSTART=1` the instance comes up already streaming,
+writing its URL and token to `/workspace/music-session.txt`. Full details, and
+the environment variables the boot script reads, are in
+[docker/README.md](docker/README.md).
+
+You do not need the image if you stop and start one instance rather than renting
+fresh boxes — `/workspace` persists across a stop, so provisioning is already a
+one-time cost there.
+
 Not tested on CUDA hardware from here — the JAX backend is the one the upstream
 package ships for it, and the player's calls into it are the same two methods
 the MLX backend exposes, but the first run on a real GPU is still the first run.
@@ -598,8 +676,11 @@ brief glitch beats drifting minutes behind the table.
 | [music_server.py](music_server.py) | HTTP server: MP3 broadcast, `/prompt`, `/status` |
 | [prompt_enhancer.py](prompt_enhancer.py) | Scene text → music style, via an LLM |
 | [foundry-module/](foundry-module/) | The Foundry VTT module and its setup guide |
-| `.env` | API keys — gitignored; copy `.env.example` to create it |
 | [foundry-module/build-release.sh](foundry-module/build-release.sh) | Builds the module zip for a GitHub release |
+| [docker/](docker/) | Prebuilt Vast.ai template image: Dockerfile and boot scripts |
+| [.github/workflows/image.yml](.github/workflows/image.yml) | Builds and pushes that image from a GitHub runner |
+| [.env.example](.env.example) | Template for `.env` — API key, token, tunnel settings |
+| `.env` | Those values, filled in — gitignored, never committed |
 
 ### HTTP endpoints (`--serve`)
 
@@ -613,8 +694,9 @@ brief glitch beats drifting minutes behind the table.
 All accept the token as `?token=...` or an `X-Music-Token` header — the query
 parameter exists because an `<audio>` element cannot send custom headers.
 
-`POST /prompt` takes `morph`, `temp`, `topk`, `cfg` and `llm` alongside (or
-instead of) `text`, so a client can retune without changing the style. Values
+`POST /prompt` takes `morph`, `temp`, `topk`, `cfg`, `llm` and `guidance`
+alongside (or instead of) `text`, so a client can retune, or reset the standing
+direction, without changing the style. Values
 are clamped rather than rejected — they arrive from a slider in someone else's
 browser, and a wild number should not be able to destabilise the generator
 mid-session. The response echoes the full `/status` payload, so a client never

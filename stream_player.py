@@ -23,6 +23,8 @@ Commands while running:
     <any text>      steer toward a new style (rewritten by the LLM)
     /raw <text>     steer using your exact words, no rewriting
     /llm on|off     toggle prompt rewriting
+    /guidance ...   standing direction for the rewriter ("keep it ambient");
+                    /guidance alone shows it, /guidance clear removes it
     /morph 4        seconds to cross-fade between styles (default 1.6)
     /temp 1.3       sampling temperature
     /topk 40        top-k
@@ -169,13 +171,27 @@ class StreamingPlayer:
     self.server = None
     self._steer_lock = threading.Lock()  # /music and the console can collide
 
+    # House rules the rewriter follows on every line: how this table's music
+    # should sound, and what recurring names mean. Kept here rather than only
+    # on the enhancer so it survives the enhancer being absent (no API key)
+    # and can still be reported to Foundry.
+    self.guidance = prompt_enhancer.clean_guidance(args.guidance)
+
     key = prompt_enhancer.find_api_key(args.api_key)
     self.enhancer = (None if (key is None or args.no_llm) else
                      prompt_enhancer.PromptEnhancer(
                          key, model=args.llm_model, timeout=args.llm_timeout,
                          max_tokens=args.llm_max_tokens,
-                         reasoning_effort=args.llm_effort))
+                         reasoning_effort=args.llm_effort,
+                         guidance=self.guidance))
     self.use_llm = self.enhancer is not None
+
+  def set_guidance(self, text: str | None) -> str:
+    """Replace the standing direction; returns what was actually kept."""
+    self.guidance = prompt_enhancer.clean_guidance(text)
+    if self.enhancer is not None:
+      self.enhancer.guidance = self.guidance
+    return self.guidance
 
   def _embed(self, text: str) -> np.ndarray:
     return np.asarray(self.mrt.embed_style(text, use_mapper=True),
@@ -214,6 +230,7 @@ class StreamingPlayer:
     able to make the generator unstable mid-session.
     """
     applied = []
+    previous_guidance = self.guidance
     for key, value in tuning.items():
       try:
         if key == 'morph':
@@ -231,6 +248,14 @@ class StreamingPlayer:
           with self._cond_lock:
             self.cfg = min(10.0, max(0.0, float(value)))
           applied.append(f'cfg={self.cfg:.1f}')
+        elif key == 'guidance':
+          # Foundry sends this with every prompt so a restart here cannot
+          # leave the table on a stale direction, so the common case is that
+          # it has not changed -- and saying so on every line would bury the
+          # prompts it is meant to sit next to.
+          if self.set_guidance(value) != previous_guidance:
+            applied.append(f'direction={self.guidance!r}' if self.guidance
+                           else 'direction cleared')
         elif key == 'llm':
           want = bool(value)
           if want and self.enhancer is None:
@@ -366,6 +391,9 @@ class StreamingPlayer:
         'model': self.args.model,
         'backend': self.args.backend,
         'llm': self.enhancer.model if self.use_llm else None,
+        # Echoed back so the module can tell "the GM has not written one" from
+        # "this server never received the one they wrote".
+        'guidance': self.guidance,
         # Clients show this so a silent stream can be told apart from a stream
         # that is playing something the listener simply cannot hear.
         'starved': round(self.buffer.starved_samples / SAMPLE_RATE, 2),
@@ -385,7 +413,8 @@ class StreamingPlayer:
       left = self.enhancer.remaining_requests
       llm = self.enhancer.model + (f' ({left} rewrites left in quota)'
                                    if left is not None else '')
-    return (f'llm={llm}\n  '
+    direction = (f'direction="{self.guidance}"\n  ' if self.guidance else '')
+    return (f'llm={llm}\n  ' + direction +
             f'prompt="{self.prompt}"  buffer={self.buffer.available_seconds():.1f}s  '
             f'speed={self.buffer.speed:.3f}x  gen={self._rtf:.2f}x realtime  '
             f'generated={self._generated_s:.0f}s  '
@@ -437,6 +466,8 @@ class StreamingPlayer:
     if self.use_llm:
       print(f'Describe what is happening and {self.enhancer.model} turns it '
             'into a style prompt (/raw to bypass, /llm off to disable).')
+      if self.guidance:
+        print(f'Standing direction: {self.guidance}')
     elif not self.args.no_llm:
       print('No LLM API key found, so text is sent to the music model as-is. '
             'Put GROQ_API_KEY=... in .env to enable prompt rewriting.')
@@ -495,6 +526,14 @@ class StreamingPlayer:
           else:
             print(f'  prompt rewriting is '
                   f'{"on" if self.use_llm else "off"}; use /llm on|off')
+        elif cmd == '/guidance':
+          if not arg:
+            print(f'  direction: {self.guidance or "(none)"}')
+          elif arg.lower() in ('clear', 'none', 'off'):
+            self.set_guidance('')
+            print('  direction cleared')
+          else:
+            print(f'  direction: {self.set_guidance(arg)}')
         elif cmd == '/status':
           print('  ' + self.status())
         elif cmd == '/save':
@@ -566,6 +605,11 @@ def main() -> None:
   p.add_argument('--llm-effort', default='low',
                  choices=['low', 'medium', 'high'],
                  help='reasoning effort, for models that support it')
+  p.add_argument('--guidance', default=None,
+                 help='standing direction added to the rewriter\'s system '
+                      'prompt, e.g. "keep the music ambient, never '
+                      'overpowering". The Foundry module sets this itself and '
+                      'will overwrite whatever is passed here.')
   p.add_argument('--api-key', default=None,
                  help='API key (default: GROQ_API_KEY/CEREBRAS_API_KEY from '
                       'the environment, then from .env)')

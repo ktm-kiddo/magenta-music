@@ -10,6 +10,10 @@ are fast enough (well under a second for a line this short) to sit in an
 interactive loop. Set DEFAULT_ENDPOINT and DEFAULT_MODEL below; put the key in
 .env next to this file (`GROQ_API_KEY=...`) or pass --api-key. The key is
 deliberately not a constant in this file so it cannot be committed by accident.
+
+The table can bend the rewriter without touching this file: `guidance` is free
+text appended to the system prompt (see build_system_prompt), written by the GM
+in Foundry or passed as --guidance to stream_player.py.
 """
 
 import os
@@ -47,6 +51,54 @@ Rules:
 - Always answer with exactly one style line, even if the input is vague, a \
 greeting, or not a scene at all. Never ask a question.
  - ALWAYS make it instumental - no lyrics please."""
+
+# Extra standing direction, written by the GM in Foundry (Module Settings ->
+# Music direction) and sent along with every prompt. Two things it is for: how
+# this table's music should sound in general ("keep it ambient, never
+# overpowering"), and what recurring names mean ("The Town is a small Spanish
+# coastal village") -- neither of which a per-scene line should have to repeat.
+#
+# Capped because it rides on every request, and because past a certain length
+# it stops colouring the rules above and starts drowning them.
+MAX_GUIDANCE_CHARS = 1500
+
+# Appended after the rules, so it sits as close as possible to the few-shot
+# turns it may have to beat: "keep it ambient" has to survive an example whose
+# answer is "aggressive orchestral metal", hence saying so outright.
+_GUIDANCE_BLOCK = """
+
+Standing direction from the game master. It overrides the examples and \
+anything above that contradicts it:
+<direction>
+{guidance}
+</direction>
+It says how this table's music should sound and what recurring names mean. It \
+never changes the output format: still ONE line of comma-separated musical \
+descriptors, nothing else."""
+
+
+def clean_guidance(text: str | None) -> str:
+  """Trim GM-written direction to what is safe to paste into the prompt.
+
+  Mirrored by cleanGuidance() in the Foundry module so that what the GM sees
+  in the editor is what the model is actually given.
+  """
+  if not text:
+    return ''
+  # The closing tag is the one string that could end the block early and let
+  # the rest be read as instructions in their own right, so it cannot survive.
+  text = re.sub(r'</?direction>', '', str(text), flags=re.IGNORECASE)
+  lines = [line.strip() for line in text.splitlines()]
+  return '\n'.join(line for line in lines if line)[:MAX_GUIDANCE_CHARS].strip()
+
+
+def build_system_prompt(guidance: str | None = None) -> str:
+  """The system prompt, with the table's standing direction folded in."""
+  guidance = clean_guidance(guidance)
+  if not guidance:
+    return _SYSTEM
+  return _SYSTEM + _GUIDANCE_BLOCK.format(guidance=guidance)
+
 
 # Few-shot turns: small models follow the format far more reliably with these.
 _EXAMPLES = [
@@ -116,20 +168,26 @@ class PromptEnhancer:
   def __init__(self, api_key: str, model: str = DEFAULT_MODEL,
                timeout: float = 5.0, endpoint: str = DEFAULT_ENDPOINT,
                max_tokens: int = DEFAULT_MAX_TOKENS,
-               reasoning_effort: str | None = 'low'):
+               reasoning_effort: str | None = 'low',
+               guidance: str = ''):
     self.api_key = api_key
     self.model = model
     self.timeout = timeout
     self.endpoint = endpoint
     self.max_tokens = max_tokens
     self.reasoning_effort = reasoning_effort
+    # Rebound while a rewrite may be in flight (an HTTP thread sets it, this
+    # object is used from another). A plain string assignment is atomic, so
+    # the worst case is one request that used the direction it started with.
+    self.guidance = clean_guidance(guidance)
     self.remaining_requests: str | None = None  # from last response headers
 
   def enhance(self, text: str, current_style: str | None = None
               ) -> tuple[str, str | None]:
     """Return (style_prompt, error). On any failure the input is passed through
     unchanged, so a network problem degrades to the old behaviour."""
-    messages = [{'role': 'system', 'content': _SYSTEM}]
+    messages = [{'role': 'system',
+                 'content': build_system_prompt(self.guidance)}]
     for user, assistant in _EXAMPLES:
       messages.append({'role': 'user', 'content': user})
       messages.append({'role': 'assistant', 'content': assistant})

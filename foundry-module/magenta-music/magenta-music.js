@@ -51,9 +51,18 @@ let panel = null;
 let dragging = false;     // a slider is being dragged; don't redraw under it
 let draft = { text: "", raw: false, advanced: false };  // survives re-renders
 
+/* On-screen widget -------------------------------------------------------- */
+let widget = null;        // the floating readout, when this client has it on
+let widgetGrab = null;    // {dx, dy} while it is being dragged
+let widgetTick = null;    // 1s timer, so the delay figure keeps moving
+
 /* Presets ----------------------------------------------------------------- */
 let PresetManagerClass = null;  // built at init, once Foundry's classes exist
 let presetManager = null;       // the one open manager window
+
+/* Direction --------------------------------------------------------------- */
+let DirectionEditorClass = null;
+let directionEditor = null;     // the one open direction window
 
 // Whatever the browser buffers before it starts playing becomes permanent
 // delay: from then on it receives and plays at the same rate, so the gap never
@@ -64,6 +73,12 @@ const LIVE_LAG_TARGET = 0.3;  // where we want to sit behind the live edge
 const LIVE_LAG_LIMIT = 1.0;   // above this, correct it
 
 const STATUS_POLL_MS = 6000;
+
+// The widget's own redraw. The server is still polled every STATUS_POLL_MS;
+// this only re-reads what the browser already knows -- how far behind the live
+// edge this client is -- so a readout that calls itself realtime moves.
+const WIDGET_TICK_MS = 1000;
+
 const REQUEST_TIMEOUT_MS = 6000;
 const NOTIFY_COOLDOWN_MS = 60000;
 
@@ -80,6 +95,22 @@ const DEFAULT_PRESETS = [
 // survive the move to structured ones; see migratePresets().
 const LEGACY_DEFAULT_PRESETS = DEFAULT_PRESETS
   .map(p => `${p.label} | ${p.style}`).join("\n");
+
+// The GM's standing direction is appended to the rewriter's system prompt on
+// the music server, so the cap has to match MAX_GUIDANCE_CHARS in
+// prompt_enhancer.py -- a longer one would be silently truncated there and the
+// GM would be reading rules the model never saw.
+const MAX_GUIDANCE = 1500;
+
+// Offered in the editor as one-click starting points, because "write house
+// rules for an AI" is a blank page and these are the two kinds of thing that
+// actually work: how it should sound, and what a name means.
+const GUIDANCE_EXAMPLES = [
+  "Always keep the music ambient and in the background — never overpowering.",
+  "When I say The Town, I mean a small Spanish coastal village.",
+  "Prefer acoustic instruments; no synths or electronic drums.",
+  "This campaign is bleak — even the victories should sound uneasy."
+];
 
 // Generation knobs a preset may pin. Anything absent is left as the server has
 // it, so a preset can change the style, the knobs, or both.
@@ -112,6 +143,24 @@ function serverUrl() {
 
 function serverToken() {
   return (setting("serverToken") ?? "").trim();
+}
+
+/** The table's standing direction for the prompt rewriter. */
+function guidance() {
+  return (setting("guidance") ?? "").trim();
+}
+
+/**
+ * Trim written direction to exactly what the music server will keep.
+ *
+ * Mirrors clean_guidance() in prompt_enhancer.py: the GM should never save
+ * something and have the far end quietly hold a different version of it.
+ */
+function cleanGuidance(text) {
+  return String(text ?? "")
+    .replace(/<\/?direction>/gi, "")
+    .split("\n").map(line => line.trim()).filter(Boolean).join("\n")
+    .slice(0, MAX_GUIDANCE).trim();
 }
 
 /** Token as a query string, for URLs that cannot carry a custom header. */
@@ -422,6 +471,26 @@ async function diagnose() {
     else add("info", "Prompt rewriting is off",
       "Scene descriptions go to the music model unchanged, which embeds poorly. "
       + "Set an API key in .env on the music server for better results.");
+
+    // The direction is written here and used there, so it is worth saying
+    // outright which of the two is speaking -- a direction that has no effect
+    // looks exactly like a direction the model chose to ignore.
+    const wanted = guidance();
+    if (!wanted) add("info", "No music direction is set",
+      "Standing rules like \"keep it ambient\" or \"The Town is a Spanish "
+      + "fishing village\" go in Module Settings → Music direction.");
+    else if (!data.llm) add("warn", "The music direction is not being used",
+      "It is part of the AI rewrite, and rewriting is off. Turn it back on "
+      + "with /music llm on.");
+    else if (data.guidance === undefined) add("warn",
+      "This music server is too old to accept a direction",
+      "Update stream_player.py and prompt_enhancer.py on the music machine. "
+      + "Until then the direction has no effect on the music.");
+    else if (cleanGuidance(data.guidance) !== cleanGuidance(wanted)) add("warn",
+      "The music server is on a different direction",
+      `It is using: ${data.guidance || "(none)"}. Send a prompt, or reopen `
+      + "Music direction and save, to push the current one.");
+    else add("ok", "The music direction is in force", wanted);
     if (data.starved > 1) add("warn", `The generator has starved for ${data.starved}s`,
       "Audio is dropping out at the source. Switch to mrt2_small or raise "
       + "--target-buffer on the music server.");
@@ -544,7 +613,14 @@ async function fetchStatus({ notify = false } = {}) {
  * @param {string} text                Scene description, or "" to only retune.
  * @param {object} [options]
  * @param {boolean} [options.raw]      Skip the LLM rewrite, use these words.
- * @param {object} [options.tuning]    Any of morph/temp/topk/cfg/llm.
+ * @param {object} [options.tuning]    Any of morph/temp/topk/cfg/llm/guidance.
+ *
+ * The standing direction rides along on every call rather than being pushed
+ * once. The server holds it in memory only, so a restart, a second GM, or a
+ * world imported somewhere else would otherwise leave the table on a direction
+ * nobody at it had written; resending a short string is cheaper than detecting
+ * any of that. An explicit tuning.guidance still wins, so the editor can push
+ * a change without waiting for someone to describe a scene.
  */
 async function sendPrompt(text, { raw = false, tuning = {} } = {}) {
   // Refuse before the browser does, so the user gets the reason and not a
@@ -554,7 +630,7 @@ async function sendPrompt(text, { raw = false, tuning = {} } = {}) {
   const res = await request(`${serverUrl()}/prompt`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ text, raw, ...tuning }),
+    body: JSON.stringify({ text, raw, guidance: guidance(), ...tuning }),
     what: "POST /prompt"
   });
   const data = await res.json();
@@ -997,20 +1073,36 @@ function liveAsPreset() {
 /* -------------------------------------------------------- sidebar panel */
 
 /** The Playlists tab is where a listener looks for a transport, so build one. */
-function panelHTML() {
+/**
+ * How the stream reads right now: one label, one colour, one style line.
+ *
+ * The sidebar panel and the on-screen widget both show this, and two readouts
+ * of the same stream disagreeing is worse than either of them being wrong, so
+ * the wording lives here and they each draw it.
+ */
+function transportState() {
   const connected = !!status;
   const playing = !!audio && !audio.paused;
-  const style = status?.prompt ?? (serverUrl() ? "Not connected" : "No server URL set");
+  const muted = !setting("enabled");
+  return {
+    connected,
+    playing,
+    muted,
+    style: status?.prompt ?? (serverUrl() ? "Not connected" : "No server URL set"),
+    kind: connected ? (playing ? "live" : "idle") : "off",
+    label: !serverUrl() ? "unconfigured"
+      : !connected ? "offline"
+      : armed ? "click to start"
+      : !tablePlaying() ? "stopped by the GM"
+      : muted ? "muted for you"
+      : playing ? "live" : "connecting"
+  };
+}
+
+function panelHTML() {
+  const { connected, playing, muted, style, kind, label: stateLabel } = transportState();
   const steerable = canSteer();
   const isGM = game.user.isGM;
-  const muted = !setting("enabled");
-
-  const stateLabel = !serverUrl() ? "unconfigured"
-    : !connected ? "offline"
-    : armed ? "click to start"
-    : !tablePlaying() ? "stopped by the GM"
-    : muted ? "muted for you"
-    : playing ? "live" : "connecting";
 
   const meta = connected
     ? `${status.listeners ?? 0} listener${status.listeners === 1 ? "" : "s"}`
@@ -1040,7 +1132,11 @@ function panelHTML() {
             ${status ? "" : "disabled"}><i class="fa-solid fa-plus" inert></i></button>
     <button type="button" class="mm-preset mm-preset-tool" data-mm="preset-edit"
             data-tooltip aria-label="Add, edit and test presets"
-            ><i class="fa-solid fa-sliders" inert></i></button>` : "";
+            ><i class="fa-solid fa-sliders" inert></i></button>
+    <button type="button" class="mm-preset mm-preset-tool ${guidance() ? "mm-preset-on" : ""}"
+            data-mm="direction" data-tooltip="${esc(directionTooltip())}"
+            aria-label="Standing direction for the AI rewriter"
+            ><i class="fa-solid fa-feather-pointed" inert></i></button>` : "";
   const presetRow = (presets || presetTools)
     ? `<div class="mm-presets">${presets}${presetTools}</div>`
     : "";
@@ -1065,7 +1161,12 @@ function panelHTML() {
   <header class="playlist-header mm-header">
     <i class="fa-solid fa-tower-broadcast" inert></i>
     <strong>Live Music</strong>
-    <span class="mm-state mm-state-${connected ? (playing ? "live" : "idle") : "off"}">${stateLabel}</span>
+    <button type="button" class="mm-header-tool ${setting("widget") ? "mm-on" : ""}"
+            data-mm="widget" data-tooltip
+            aria-label="${setting("widget") ? "Hide the on-screen status widget"
+                                           : "Show a status widget on screen"}"
+            ><i class="fa-solid fa-window-restore" inert></i></button>
+    <span class="mm-state mm-state-${kind}">${stateLabel}</span>
   </header>
 
   ${error}
@@ -1120,6 +1221,10 @@ function knobHTML(key, label, value, min, max, step, unit) {
  * restored, and a slider mid-drag suppresses the redraw entirely.
  */
 function updatePanel() {
+  // The widget draws from the same state and wants refreshing at the same
+  // moments, so it is done here rather than at every call site.
+  updateWidget();
+
   if (!panel?.isConnected) { panel = null; return; }
   if (dragging) return;
 
@@ -1189,6 +1294,10 @@ function onPanelClick(event) {
     event.preventDefault();
     return guard(showDiagnostics());
   }
+  if (action === "widget") {
+    event.preventDefault();
+    return guard(game.settings.set(MODULE_ID, "widget", !setting("widget")));
+  }
   if (action === "preset") {
     event.preventDefault();
     const preset = getPresets().find(p => p.id === button.dataset.id);
@@ -1198,6 +1307,10 @@ function onPanelClick(event) {
   if (action === "preset-edit") {
     event.preventDefault();
     return guard(openPresetManager());
+  }
+  if (action === "direction") {
+    event.preventDefault();
+    return guard(openDirectionEditor());
   }
   if (action === "preset-capture") {
     event.preventDefault();
@@ -1294,14 +1407,246 @@ function injectPanel(root) {
   }
 }
 
+/* ------------------------------------------------------- on-screen widget */
+
+/*
+ * A small always-visible readout of what the music is doing.
+ *
+ * The Music tab answers this already, and so does /music status, but both are
+ * something you have to go and ask: a GM running a fight does not want to open
+ * a sidebar tab to find out whether the stream is still alive. So this is the
+ * same information, off to one side, keeping itself up to date -- and off by
+ * default, because it is one more thing on a screen that is already full.
+ *
+ * It is a per-client choice: a GM turning it on does not put it on players'
+ * screens, and each person keeps their own place for it.
+ */
+
+/** This client's remembered spot for the widget, and whether it is folded. */
+function widgetPlacement() {
+  const saved = setting("widgetPlacement") ?? {};
+  return {
+    left: Number.isFinite(saved.left) ? saved.left : null,
+    top: Number.isFinite(saved.top) ? saved.top : null,
+    collapsed: !!saved.collapsed
+  };
+}
+
+async function saveWidgetPlacement(changes) {
+  return game.settings.set(MODULE_ID, "widgetPlacement",
+    { ...widgetPlacement(), ...changes });
+}
+
+/** Keep a grabbed corner on screen, whatever the window has done since. */
+function clampWidget(left, top) {
+  const width = widget?.getBoundingClientRect().width ?? 220;
+  const keep = 32;  // never let it be dragged fully out of reach
+  return {
+    left: Math.min(Math.max(left, keep - width), window.innerWidth - keep),
+    top: Math.min(Math.max(top, 0), window.innerHeight - keep)
+  };
+}
+
+function widgetHTML() {
+  return `
+  <div class="mm-w-head">
+    <span class="mm-w-state"></span>
+    <button type="button" class="mm-w-btn" data-mm-w="open"
+            data-tooltip aria-label="Open the Music tab">
+      <i class="fa-solid fa-sliders" inert></i></button>
+    <button type="button" class="mm-w-btn" data-mm-w="collapse"
+            data-tooltip aria-label="Collapse"></button>
+    <button type="button" class="mm-w-btn" data-mm-w="close"
+            data-tooltip aria-label="Hide the widget">
+      <i class="fa-solid fa-xmark" inert></i></button>
+  </div>
+  <div class="mm-w-style"></div>
+  <div class="mm-w-meta"></div>`;
+}
+
+/**
+ * Redraw the widget's text in place.
+ *
+ * Deliberately not innerHTML: this runs every second, and rebuilding the
+ * element under the pointer would drop a drag in progress and flicker whatever
+ * tooltip is open. Only the words that changed are written.
+ */
+function updateWidget() {
+  if (!widget?.isConnected) { widget = null; return; }
+
+  const { connected, playing, style, kind, label } = transportState();
+  const { collapsed } = widgetPlacement();
+
+  widget.classList.toggle("mm-w-collapsed", collapsed);
+  widget.classList.toggle("mm-w-problem", !!lastError);
+
+  const state = widget.querySelector(".mm-w-state");
+  state.textContent = label;
+  state.className = `mm-w-state mm-w-state-${kind}`;
+
+  const collapse = widget.querySelector('[data-mm-w="collapse"]');
+  if (collapse.dataset.shows !== String(collapsed)) {
+    collapse.dataset.shows = String(collapsed);
+    collapse.innerHTML = `<i class="fa-solid fa-chevron-${collapsed ? "down" : "up"}" inert></i>`;
+    collapse.setAttribute("aria-label", collapsed ? "Expand" : "Collapse");
+  }
+
+  // A readout that only ever sits there is easy to stop believing, so when the
+  // music does change the new style is flashed once. Not on the first draw:
+  // arriving at a prompt is not the same as it having just changed.
+  const line = widget.querySelector(".mm-w-style");
+  if (line.textContent && line.textContent !== style) {
+    line.classList.remove("mm-w-fresh");
+    void line.offsetWidth;   // restart the animation rather than let it sit
+    line.classList.add("mm-w-fresh");
+  }
+  line.textContent = style;
+
+  // The same numbers /music status reports, in the order they matter when you
+  // are glancing rather than reading: who is hearing it, whether the model is
+  // keeping up, and how far behind this client is.
+  const meta = widget.querySelector(".mm-w-meta");
+  if (lastError) meta.textContent = lastError.message;
+  else if (!connected) meta.textContent = "music server unreachable";
+  else meta.textContent = [
+    `${status.listeners ?? 0} listener${status.listeners === 1 ? "" : "s"}`,
+    status.gen ? `${status.gen}× realtime` : null,
+    playing ? `${liveLag().toFixed(1)}s behind` : null
+  ].filter(Boolean).join(" · ");
+
+  // Everything that did not fit, on hover -- including, when there is one, the
+  // error in full, since the meta line above only has room for its first half.
+  const tooltip = connected
+    ? [
+        style,
+        `model ${status.model}${status.backend ? ` on ${status.backend}` : ""}`,
+        `rewriter ${status.llm ?? "off"}`,
+        `cross-fade ${status.morph}s`,
+        `buffer ${status.buffer}s`,
+        lastError?.full
+      ].filter(Boolean).join(" · ")
+    : (lastError?.full ?? style);
+  if (widget.dataset.tooltip !== tooltip) widget.dataset.tooltip = tooltip;
+}
+
+function widgetPointerDown(event) {
+  // Buttons are not a handle, and neither is a right-click.
+  if (event.button !== 0 || event.target.closest(".mm-w-btn")) return;
+  const box = widget.getBoundingClientRect();
+  widgetGrab = { dx: event.clientX - box.left, dy: event.clientY - box.top };
+  widget.classList.add("mm-w-dragging");
+  widget.setPointerCapture?.(event.pointerId);
+  event.preventDefault();
+}
+
+function widgetPointerMove(event) {
+  if (!widgetGrab) return;
+  const { left, top } = clampWidget(event.clientX - widgetGrab.dx,
+                                   event.clientY - widgetGrab.dy);
+  placeWidget(left, top);
+}
+
+function widgetPointerUp(event) {
+  if (!widgetGrab) return;
+  widgetGrab = null;
+  widget.classList.remove("mm-w-dragging");
+  widget.releasePointerCapture?.(event.pointerId);
+  const box = widget.getBoundingClientRect();
+  saveWidgetPlacement({ left: Math.round(box.left), top: Math.round(box.top) })
+    .catch(err => log("could not remember the widget position:", err?.message ?? err));
+}
+
+/** Position by explicit coordinates, giving up the CSS default corner. */
+function placeWidget(left, top) {
+  widget.style.left = `${left}px`;
+  widget.style.top = `${top}px`;
+  widget.style.right = "auto";
+  widget.style.bottom = "auto";
+}
+
+/** Bring the sidebar's Music tab up, across Foundry versions. */
+function openMusicTab() {
+  try {
+    ui.sidebar?.expand?.();  // a no-op when it is already open
+    if (ui.sidebar?.changeTab) ui.sidebar.changeTab("playlists", "primary");
+    else ui.sidebar?.activateTab?.("playlists");
+  } catch (err) {
+    log("could not open the Music tab:", err?.message ?? err);
+  }
+}
+
+function createWidget() {
+  if (widget?.isConnected) return;
+
+  widget = document.createElement("div");
+  widget.classList.add(`${MODULE_ID}-widget`);
+  widget.innerHTML = widgetHTML();
+
+  widget.addEventListener("pointerdown", widgetPointerDown);
+  widget.addEventListener("pointermove", widgetPointerMove);
+  widget.addEventListener("pointerup", widgetPointerUp);
+  widget.addEventListener("pointercancel", widgetPointerUp);
+
+  widget.addEventListener("click", (event) => {
+    const action = event.target.closest(".mm-w-btn")?.dataset?.mmW;
+    if (!action) return;
+    if (action === "open") return openMusicTab();
+    if (action === "collapse") {
+      return saveWidgetPlacement({ collapsed: !widgetPlacement().collapsed })
+        .catch(err => reportError(err, { context: "collapse the widget" }));
+    }
+    if (action === "close") {
+      ui.notifications?.info("Live Music widget hidden — /music widget brings it back.");
+      return game.settings.set(MODULE_ID, "widget", false);
+    }
+  });
+
+  document.body.appendChild(widget);
+
+  const { left, top } = widgetPlacement();
+  if (left !== null && top !== null) {
+    const spot = clampWidget(left, top);
+    placeWidget(spot.left, spot.top);
+  }
+
+  updateWidget();
+  ensureStatusPolling();
+
+  if (!widgetTick) widgetTick = setInterval(() => {
+    if (!widget?.isConnected) {
+      clearInterval(widgetTick);
+      widgetTick = null;
+      return;
+    }
+    if (!widgetGrab) updateWidget();
+  }, WIDGET_TICK_MS);
+}
+
+function destroyWidget() {
+  widget?.remove();
+  widget = null;
+  widgetGrab = null;
+  if (widgetTick) {
+    clearInterval(widgetTick);
+    widgetTick = null;
+  }
+}
+
+/** Create or remove the widget to match this client's setting. */
+function refreshWidget() {
+  if (setting("widget")) createWidget();
+  else destroyWidget();
+}
+
 function ensureStatusPolling() {
   // Always refresh on injection: opening the tab is a request to see the
   // truth now, not up to one poll interval from now.
   fetchStatus().catch(() => { /* already reported and drawn */ });
   if (statusTimer) return;
   statusTimer = setInterval(() => {
-    // Polling exists to keep the panel truthful; stop when nobody can see it.
-    if (!panel?.isConnected) {
+    // Polling exists to keep a readout truthful; stop when there is none. The
+    // widget counts as one, and outlives the sidebar tab being closed.
+    if (!panel?.isConnected && !widget?.isConnected) {
       clearInterval(statusTimer);
       statusTimer = null;
       return;
@@ -1837,12 +2182,281 @@ function openPresetManager({ captureLive = false } = {}) {
   return presetManager.render(true);
 }
 
+/* ------------------------------------------------------- music direction */
+
+/**
+ * Save the table's standing direction. GM only: it is one shared setting that
+ * shapes every prompt anyone sends, so it belongs with the person who owns the
+ * campaign's tone.
+ */
+async function setGuidance(text) {
+  if (!game.user.isGM) {
+    throw new MusicError("Only the GM can set the music direction.",
+      "It applies to everything the whole table plays. Ask your GM, or use "
+      + "/music raw <style> to change one scene yourself.");
+  }
+  return game.settings.set(MODULE_ID, "guidance", cleanGuidance(text));
+}
+
+/** The panel button's tooltip: the direction itself, or an invitation. */
+function directionTooltip() {
+  const text = guidance();
+  return text ? `Music direction:\n${text}`
+    : "No music direction set — write standing rules for the AI rewriter";
+}
+
+const DIRECTION_EDITOR_METHODS = {
+
+  /** Take a working copy. Typing edits this, not the setting. */
+  prepareState() {
+    if (this.text === null || this.text === undefined) this.text = guidance();
+  },
+
+  buildHTML() {
+    const text = this.text ?? "";
+    const dirty = cleanGuidance(text) !== guidance();
+    const examples = GUIDANCE_EXAMPLES.map((line, i) =>
+      `<button type="button" class="mm-dir-example" data-dir="example" data-index="${i}"
+               data-tooltip="Add this line">${esc(line)}</button>`).join("");
+
+    return `
+    <div class="mm-dir">
+      <p class="mm-dir-intro">
+        Standing rules the AI follows every time it turns a scene into music.
+        Good for how this table should sound in general, and for what recurring
+        names mean. It does not replace <b>/music</b> — it colours every use of
+        it. Leave it empty for the stock behaviour.
+      </p>
+      <textarea class="mm-dir-text" data-dir="text" rows="8"
+                maxlength="${MAX_GUIDANCE}"
+                placeholder="Always keep the music ambient and in the background.&#10;When I say The Town, I mean a small Spanish coastal village."
+                >${esc(text)}</textarea>
+      <div class="mm-dir-count ${text.length > MAX_GUIDANCE - 100 ? "mm-dir-count-near" : ""}">
+        ${text.length} / ${MAX_GUIDANCE} characters
+      </div>
+
+      <div class="mm-dir-examples">
+        <span>Add an example:</span>
+        ${examples}
+      </div>
+
+      <footer class="mm-dir-footer">
+        <div class="mm-dir-live">${this.liveHTML()}</div>
+        <div class="mm-dir-commit">
+          <button type="button" data-dir="clear" ${text ? "" : "disabled"}>
+            <i class="fa-solid fa-eraser" inert></i> Clear</button>
+          <button type="button" data-dir="cancel" ${dirty ? "" : "disabled"}>Discard changes</button>
+          <button type="button" data-dir="save" class="mm-dir-save" ${dirty ? "" : "disabled"}>
+            <i class="fa-solid fa-floppy-disk" inert></i> Save direction</button>
+        </div>
+      </footer>
+    </div>`;
+  },
+
+  /**
+   * What the music server says it is actually using. The direction is written
+   * here and applied there, so showing only what was typed would hide the one
+   * failure that matters: a server that never received it.
+   */
+  liveHTML() {
+    if (!status) {
+      return `<i class="fa-solid fa-circle-question" inert></i>
+        <span>The music server is not answering, so what it is using cannot be shown.</span>`;
+    }
+    if (status.guidance === undefined) {
+      return `<i class="fa-solid fa-triangle-exclamation" inert></i>
+        <span>This music server is too old to accept a direction — update
+        stream_player.py on the machine generating the music.</span>`;
+    }
+    if (!status.llm) {
+      return `<i class="fa-solid fa-triangle-exclamation" inert></i>
+        <span>Prompt rewriting is off, so the direction is not being applied.
+        Turn it on with <b>/music llm on</b>.</span>`;
+    }
+    const applied = cleanGuidance(status.guidance);
+    if (!applied) {
+      return `<i class="fa-solid fa-circle-info" inert></i>
+        <span>The server has no direction yet; saving sends it.</span>`;
+    }
+    return `<i class="fa-solid fa-check" inert></i>
+      <span class="ellipsis">In force on the server: <i>${esc(applied.replace(/\n/g, " · "))}</i></span>`;
+  },
+
+  attach(root) {
+    this.root = root;
+    if (this.boundRoot !== root) {
+      this.boundRoot = root;
+      root.addEventListener("click", this.onClick.bind(this));
+      root.addEventListener("input", this.onEdit.bind(this));
+    }
+    if (!status) fetchStatus().then(() => this.refreshLive()).catch(() => this.refreshLive());
+  },
+
+  /** Redraw, keeping the caret: the counter and the buttons live outside the box. */
+  refresh() {
+    if (!this.root?.isConnected) return;
+    const active = document.activeElement;
+    const caret = this.root.contains(active) ? caretOf(active) : null;
+    const scroll = this.root.querySelector(".mm-dir-text")?.scrollTop ?? 0;
+
+    this.root.innerHTML = this.buildHTML();
+
+    if (caret === null) return;
+    const box = this.root.querySelector(".mm-dir-text");
+    if (!box) return;
+    box.scrollTop = scroll;
+    box.focus({ preventScroll: true });
+    try { box.setSelectionRange(caret, caret); } catch (err) { /* not a text box */ }
+  },
+
+  /** Only the server line, so a status poll cannot land under the caret. */
+  refreshLive() {
+    const live = this.root?.querySelector(".mm-dir-live");
+    if (live) live.innerHTML = this.liveHTML();
+  },
+
+  /** The setting changed elsewhere (another GM, or our own save). */
+  refreshSaved() {
+    if (!this.root?.isConnected) return;
+    // Only follow it when nothing is half-typed here, so a poll or another
+    // GM cannot wipe out what this one is in the middle of writing.
+    if (cleanGuidance(this.text) === guidance()) this.text = guidance();
+    this.refresh();
+  },
+
+  onEdit(event) {
+    if (event.target.dataset?.dir !== "text") return;
+    this.text = event.target.value;
+    this.refresh();
+  },
+
+  onClick(event) {
+    const button = event.target.closest("[data-dir]");
+    if (!button || button.tagName === "TEXTAREA") return;
+    const action = button.dataset.dir;
+    const guard = (promise) => Promise.resolve(promise)
+      .catch(err => reportError(err, { context: "music direction" }));
+
+    if (action === "example") {
+      const line = GUIDANCE_EXAMPLES[Number(button.dataset.index)];
+      const current = (this.text ?? "").trim();
+      if (!current.split("\n").includes(line)) {
+        this.text = current ? `${current}\n${line}` : line;
+      }
+      return this.refresh();
+    }
+    if (action === "clear") {
+      this.text = "";
+      return this.refresh();
+    }
+    if (action === "cancel") {
+      this.text = guidance();
+      return this.refresh();
+    }
+    if (action === "save") {
+      // Normalise into the box as well as into the setting, so a GM who
+      // pasted something odd sees what was actually kept.
+      this.text = cleanGuidance(this.text);
+      return guard(setGuidance(this.text).then(() => {
+        ui.notifications?.info(this.text
+          ? "Live Music: direction saved. It applies to the next prompt."
+          : "Live Music: direction cleared.");
+        this.refresh();
+      }));
+    }
+  }
+};
+
+/** Same dual-base dance as the preset manager; see buildPresetManagerClass. */
+function buildDirectionEditorClass() {
+  const ApplicationV2 = foundry.applications?.api?.ApplicationV2;
+  const shared = {
+    id: "magenta-music-direction",
+    classes: ["magenta-music-direction"],
+    title: "Music direction",
+    width: 560,
+    height: 520
+  };
+
+  if (ApplicationV2) {
+    class DirectionEditorV2 extends ApplicationV2 {
+      static DEFAULT_OPTIONS = {
+        id: shared.id,
+        classes: shared.classes,
+        window: { title: shared.title, icon: "fa-solid fa-feather-pointed", resizable: true },
+        position: { width: shared.width, height: shared.height }
+      };
+
+      async _renderHTML() {
+        this.prepareState();
+        return this.buildHTML();
+      }
+
+      _replaceHTML(result, content) {
+        content.innerHTML = result;
+        this.attach(content);
+      }
+    }
+    Object.assign(DirectionEditorV2.prototype, DIRECTION_EDITOR_METHODS);
+    return DirectionEditorV2;
+  }
+
+  class DirectionEditorV1 extends FormApplication {
+    static get defaultOptions() {
+      return foundry.utils.mergeObject(super.defaultOptions, {
+        ...shared,
+        resizable: true,
+        closeOnSubmit: false,
+        submitOnChange: false,
+        submitOnClose: false
+      });
+    }
+
+    async _renderInner() {
+      this.prepareState();
+      return $(`<div class="mm-dir-wrap">${this.buildHTML()}</div>`);
+    }
+
+    activateListeners(html) {
+      super.activateListeners(html);
+      this.attach(html[0] ?? html);
+    }
+
+    async _updateObject() { /* saving is the Save button's job */ }
+  }
+  Object.assign(DirectionEditorV1.prototype, DIRECTION_EDITOR_METHODS);
+  return DirectionEditorV1;
+}
+
+function buildDirectionMenuClass() {
+  const Base = foundry.applications?.api?.ApplicationV2 ?? FormApplication;
+  return class DirectionSettingsMenu extends Base {
+    render() {
+      openDirectionEditor();
+      return this;
+    }
+  };
+}
+
+function openDirectionEditor() {
+  if (!game.user.isGM) {
+    throw new MusicError("Only the GM can edit the music direction.",
+      "Type /music direction to see what it currently says.");
+  }
+  DirectionEditorClass ??= buildDirectionEditorClass();
+  directionEditor ??= new DirectionEditorClass();
+  // Reopening starts from what is saved, rather than from an abandoned edit.
+  if (!directionEditor.rendered) directionEditor.text = null;
+  return directionEditor.render(true);
+}
+
 /* --------------------------------------------------------------- commands */
 
 const COMMAND_HELP =
   `<p><b>/music &lt;what is happening&gt;</b> — adapt the soundtrack.<br>` +
   `<b>/music raw &lt;style&gt;</b> — skip the AI rewrite.<br>` +
   `<b>/music status</b> — what is playing.<br>` +
+  `<b>/music widget</b> — a small on-screen readout of the same thing (<b>on</b>/<b>off</b>).<br>` +
   `<b>/music diagnose</b> — check every reason it might not be working.<br>` +
   `<b>/music play</b> / <b>pause</b> — for the table if you are the GM, else for you.<br>` +
   `<b>/music on</b> / <b>off</b> — your own playback only.<br>` +
@@ -1853,11 +2467,14 @@ const COMMAND_HELP =
   `<b>/music llm on|off</b> — prompt rewriting.<br>` +
   `<b>/music preset &lt;name&gt;</b> — play a saved preset.<br>` +
   `<b>/music presets</b> — list them. <b>/music presets edit</b> — add, test and adjust them (GM).<br>` +
-  `<b>/music preset save &lt;name&gt;</b> — keep what is playing now as a preset (GM).</p>`;
+  `<b>/music preset save &lt;name&gt;</b> — keep what is playing now as a preset (GM).<br>` +
+  `<b>/music direction</b> — the standing rules the AI follows. ` +
+  `<b>/music direction &lt;rule&gt;</b> to set them, <b>clear</b> to remove them, ` +
+  `<b>edit</b> for the editor (GM).</p>`;
 
-const COMMANDS = ["help", "status", "diagnose", "play", "pause", "stop", "resume",
-  "on", "off", "sync", "preset", "presets", "volume", "morph", "temp",
-  "topk", "cfg", "llm", "raw"];
+const COMMANDS = ["help", "status", "widget", "diagnose", "play", "pause", "stop",
+  "resume", "on", "off", "sync", "preset", "presets", "direction", "volume",
+  "morph", "temp", "topk", "cfg", "llm", "raw"];
 
 const KNOB_EXAMPLES = { morph: "3", temp: "1.2", topk: "40", cfg: "3" };
 
@@ -1911,6 +2528,46 @@ async function handleMusicCommand(argument) {
       return postLocal(`<p>Skipped ${lag.toFixed(1)}s of buffered delay.</p>`);
     }
 
+    // "/music direction", "/music direction edit", "/music direction clear",
+    // "/music direction keep it ambient". Setting by typing is deliberate:
+    // one-line rules are most of them, and the editor is one word away for
+    // the rest.
+    const direction = arg.match(/^direction\b\s*([^]*)$/i);
+    if (direction) {
+      const rest = direction[1].trim();
+      const current = guidance();
+
+      if (!rest || /^(show|status)$/i.test(rest)) {
+        return postLocal(current
+          ? `<p><b>Music direction</b><br>${esc(current).replace(/\n/g, "<br>")}</p>`
+            + (game.user.isGM
+              ? `<p><i>/music direction edit</i> to change it.</p>` : "")
+          : `<p>No music direction is set.`
+            + (game.user.isGM
+              ? ` Add one with <i>/music direction edit</i>, or type it: `
+                + `<i>/music direction always keep the music ambient</i>.`
+              : ` Only the GM can set one.`) + `</p>`);
+      }
+      if (/^(edit|manage|set|add|new)$/i.test(rest)) return openDirectionEditor();
+
+      if (/^(clear|none|off|reset)$/i.test(rest)) {
+        if (!current) return postLocal("<p>There was no music direction to clear.</p>");
+        await setGuidance("");  // the setting's onChange pushes it to the server
+        return postLocal("<p>Music direction cleared.</p>");
+      }
+
+      const kept = cleanGuidance(rest);
+      if (!kept) {
+        throw new MusicError("That direction is empty once trimmed.",
+          "Write it as a plain sentence, like /music direction keep the music "
+          + "ambient and in the background.");
+      }
+      await setGuidance(kept);
+      return postLocal(`<p><b>Music direction set</b><br>${esc(kept)}</p>`
+        + (current ? `<p><i>It replaced: ${esc(current)}</i></p>` : "")
+        + `<p><i>It applies to the next /music prompt.</i></p>`);
+    }
+
     // "/music preset tavern", "/music presets", "/music presets edit",
     // "/music preset save Ambush". Saving is namespaced under "preset" rather
     // than being its own verb because "/music save the village from the fire"
@@ -1958,6 +2615,21 @@ async function handleMusicCommand(argument) {
           `Try one of: ${presets.map(p => p.label).join(", ")}.`);
       }
       return applyPreset(wanted);
+    }
+
+    // "/music widget", "/music widget on|off". A bare word toggles, because
+    // the reason to type it is that the thing is either there or it is not.
+    const widgetArg = arg.match(/^widget\b\s*(.*)$/i);
+    if (widgetArg) {
+      const word = widgetArg[1].trim().toLowerCase();
+      if (word && word !== "on" && word !== "off") {
+        throw new MusicError(`"${widgetArg[1].trim()}" is not on or off.`,
+          "Use /music widget to toggle it, or /music widget on|off.");
+      }
+      const wanted = word ? word === "on" : !setting("widget");
+      await game.settings.set(MODULE_ID, "widget", wanted);
+      return postLocal(`<p>The status widget is ${wanted ? "on" : "off"}`
+        + (wanted ? " — drag it wherever you want it." : ".") + `</p>`);
     }
 
     if (arg === "status") {
@@ -2123,6 +2795,43 @@ Hooks.once("init", () => {
     default: true
   });
 
+  // Standing direction for the prompt rewriter: house rules about how this
+  // table's music should sound, and what recurring names mean. Stored here and
+  // applied on the music server, so both ends have to be kept in step -- see
+  // sendPrompt(), which resends it, and diagnose(), which compares them.
+  //
+  // config:false because a one-line settings input is the wrong shape for
+  // several rules; the menu below opens a proper editor.
+  game.settings.register(MODULE_ID, "guidance", {
+    scope: "world",
+    config: false,
+    type: String,
+    default: "",
+    onChange: () => {
+      updatePanel();
+      directionEditor?.refreshSaved?.();
+      // Push it now rather than waiting for someone to describe a scene, so
+      // the editor's "in force on the server" line tells the truth. Only the
+      // GM does it: every client sees this change, and a table of eight would
+      // otherwise send eight identical requests.
+      if (!game.user.isGM) return;
+      retune({ guidance: guidance() })
+        .then(() => fetchStatus())
+        .catch(err => reportError(err, { context: "music direction" }));
+    }
+  });
+
+  game.settings.registerMenu(MODULE_ID, "musicDirection", {
+    name: "Music direction",
+    label: "Write the standing direction",
+    hint: "House rules the AI follows every time it turns a scene into music: "
+        + "how this table should sound in general (\"keep it ambient\"), and "
+        + "what recurring names mean (\"The Town is a Spanish fishing village\").",
+    icon: "fa-solid fa-feather-pointed",
+    type: buildDirectionMenuClass(),
+    restricted: true
+  });
+
   // The presets themselves. Edited through the manager below rather than in
   // the settings form: a preset is a label, some words, a rewrite choice and
   // up to four knobs, and it is worth testing before it is kept.
@@ -2207,6 +2916,33 @@ Hooks.once("init", () => {
     onChange: () => { busDisabled = false; refreshPlaybackState(); }
   });
 
+  // Off by default: the screen is already full, and the sidebar tab answers
+  // the same question for anyone who has not asked for a second readout.
+  game.settings.register(MODULE_ID, "widget", {
+    name: "Show the on-screen status widget",
+    hint: "A small draggable readout of what the music is doing — the same "
+        + "information as /music status, without opening the Music tab. Drag "
+        + "it anywhere; it stays where you leave it. Yours alone: turning it "
+        + "on does not put it on anyone else's screen.",
+    scope: "client",
+    config: true,
+    type: Boolean,
+    default: false,
+    // The panel's header button shows this state, so it is redrawn too rather
+    // than waiting up to a poll interval to catch up with a press of itself.
+    onChange: () => { refreshWidget(); updatePanel(); }
+  });
+
+  // Where this client left the widget, and whether it is folded down to the
+  // one status line. Not in the settings form: it is set by dragging it.
+  game.settings.register(MODULE_ID, "widgetPlacement", {
+    scope: "client",
+    config: false,
+    type: Object,
+    default: { left: null, top: null, collapsed: false },
+    onChange: () => updateWidget()
+  });
+
   game.settings.register(MODULE_ID, "autoSync", {
     name: "Keep up with the live edge",
     hint: "Periodically skip buffered audio so you hear changes as soon as " +
@@ -2240,6 +2976,7 @@ Hooks.once("ready", () => {
   });
 
   refreshPlaybackState();
+  refreshWidget();
 
   // Presets moved from a text setting to structured data in 1.2; carry an
   // existing world's list across before anything reads it.
@@ -2260,6 +2997,15 @@ Hooks.once("ready", () => {
   // told about things they can act on; the rest is the GM's to fix.
   fetchStatus({ notify: game.user.isGM }).catch(() => { /* reported */ });
   log("ready; streaming from", serverUrl() || "(no URL configured)");
+});
+
+// A window that shrinks must not take the widget off screen with it: the only
+// way back would be to turn the setting off and on again.
+window.addEventListener("resize", () => {
+  if (!widget?.isConnected) return;
+  const box = widget.getBoundingClientRect();
+  const spot = clampWidget(box.left, box.top);
+  if (spot.left !== box.left || spot.top !== box.top) placeWidget(spot.left, spot.top);
 });
 
 // Keep in step with the core Music slider when we are not routed through it.

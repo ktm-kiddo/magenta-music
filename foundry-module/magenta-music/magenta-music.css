@@ -127,6 +127,14 @@
   opacity: 1;
 }
 
+/* A direction is invisible in the music itself, so the button that holds one
+   says so -- otherwise the only way to know is to open it. */
+.magenta-music-panel .mm-preset-on {
+  opacity: 1;
+  border-color: rgba(76, 175, 80, 0.6);
+  background: rgba(76, 175, 80, 0.12);
+}
+
 .magenta-music-panel .mm-advanced summary {
   cursor: pointer;
   font-size: var(--font-size-11, 11px);
@@ -435,4 +443,275 @@
 
 .magenta-music-presets .mm-pm-save {
   font-weight: bold;
+}
+
+
+/* ------------------------------------------------------- music direction */
+
+.magenta-music-direction .window-content,
+.magenta-music-direction .window-content > form {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.magenta-music-direction .mm-dir,
+.magenta-music-direction .mm-dir-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  height: 100%;
+  min-height: 0;
+  font-size: var(--font-size-13, 13px);
+}
+
+.magenta-music-direction .mm-dir-intro {
+  margin: 0;
+  font-size: var(--font-size-12, 12px);
+  opacity: 0.8;
+}
+
+.magenta-music-direction .mm-dir-text {
+  flex: 1;
+  min-height: 6em;
+  resize: none;
+  font-family: inherit;
+  line-height: 1.5;
+}
+
+.magenta-music-direction .mm-dir-count {
+  align-self: flex-end;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.6;
+}
+
+.magenta-music-direction .mm-dir-count-near {
+  opacity: 1;
+  color: var(--color-warm-2, #b06a2c);
+}
+
+.magenta-music-direction .mm-dir-examples {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.9;
+}
+
+.magenta-music-direction .mm-dir-example {
+  width: auto;
+  flex: 0 1 auto;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 7px;
+  line-height: 1.6;
+  font-size: var(--font-size-11, 11px);
+  border-radius: 3px;
+}
+
+.magenta-music-direction .mm-dir-footer {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px solid var(--color-border-light-tertiary, rgba(120, 120, 120, 0.4));
+}
+
+.magenta-music-direction .mm-dir-live {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.85;
+}
+
+.magenta-music-direction .mm-dir-live .ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.magenta-music-direction .mm-dir-live .fa-check {
+  color: #4caf50;
+}
+
+.magenta-music-direction .mm-dir-live .fa-triangle-exclamation {
+  color: #d4a02c;
+}
+
+.magenta-music-direction .mm-dir-commit {
+  display: flex;
+  gap: 4px;
+}
+
+.magenta-music-direction .mm-dir-save {
+  font-weight: bold;
+}
+
+/*
+ * The on-screen widget.
+ *
+ * It floats over the canvas, so unlike the sidebar panel it cannot borrow a
+ * background from its surroundings -- it needs its own, dark enough to stay
+ * readable over a bright map. Everything else still comes from Foundry's
+ * variables so it follows the user's theme, and it is deliberately small: it is
+ * a glance, not a control surface.
+ */
+.magenta-music-widget {
+  position: fixed;
+  top: 8px;
+  /* Just left of the open sidebar, using its own width where Foundry
+     publishes one so the default spot lands correctly on both v12 and v13. */
+  right: calc(var(--sidebar-width, 300px) + 16px);
+  z-index: 70;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 220px;
+  max-width: 45vw;
+  padding: 4px 7px 5px;
+  border: 1px solid var(--color-border-dark, rgba(0, 0, 0, 0.6));
+  border-radius: 4px;
+  background: rgba(20, 20, 22, 0.82);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+  color: var(--color-text-light-highlight, #f0f0e0);
+  font-size: var(--font-size-12, 12px);
+  cursor: grab;
+  user-select: none;
+}
+
+.magenta-music-widget.mm-w-dragging {
+  cursor: grabbing;
+}
+
+/* A stream in trouble should be visible as such without being read. */
+.magenta-music-widget.mm-w-problem {
+  border-color: rgba(180, 60, 50, 0.75);
+}
+
+.magenta-music-widget .mm-w-head {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.magenta-music-widget .mm-w-state {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-11, 11px);
+  text-transform: lowercase;
+  opacity: 0.85;
+}
+
+.magenta-music-widget .mm-w-state::before {
+  content: "";
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 5px;
+  border-radius: 50%;
+  background: currentColor;
+  vertical-align: baseline;
+}
+
+.magenta-music-widget .mm-w-state-live::before {
+  background: #4caf50;
+  box-shadow: 0 0 4px #4caf50;
+}
+
+.magenta-music-widget .mm-w-state-idle::before { background: #d0a942; }
+.magenta-music-widget .mm-w-state-off::before { background: #b0483f; }
+
+/* The buttons stay quiet until the pointer is on the widget: at rest this
+   should read as a label, not as three things to press. */
+.magenta-music-widget .mm-w-btn {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: inherit;
+  line-height: 1;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0;
+  cursor: pointer;
+  transition: opacity 120ms ease;
+}
+
+.magenta-music-widget:hover .mm-w-btn,
+.magenta-music-widget .mm-w-btn:focus-visible {
+  opacity: 0.7;
+}
+
+.magenta-music-widget .mm-w-btn:hover {
+  opacity: 1;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.magenta-music-widget .mm-w-style {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-style: italic;
+}
+
+.magenta-music-widget .mm-w-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.7;
+}
+
+/* Folded down to the status line alone, for a screen with no room to spare. */
+.magenta-music-widget.mm-w-collapsed {
+  width: auto;
+  min-width: 8em;
+}
+
+.magenta-music-widget.mm-w-collapsed .mm-w-style,
+.magenta-music-widget.mm-w-collapsed .mm-w-meta {
+  display: none;
+}
+
+/* The one-second flash when the style changes under it. */
+@keyframes mm-w-fresh {
+  from { background: rgba(76, 175, 80, 0.35); }
+  to { background: rgba(76, 175, 80, 0); }
+}
+
+.magenta-music-widget .mm-w-style.mm-w-fresh {
+  animation: mm-w-fresh 1.2s ease-out;
+  border-radius: 2px;
+}
+
+/* The widget toggle in the panel header: the setting exists in the settings
+   form as well, but the person who wants a second readout is the person looking
+   at the first one, so it is offered here too. */
+.magenta-music-panel .mm-header-tool {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: none;
+  line-height: 1;
+  font-size: var(--font-size-11, 11px);
+  opacity: 0.45;
+  cursor: pointer;
+}
+
+.magenta-music-panel .mm-header-tool:hover,
+.magenta-music-panel .mm-header-tool.mm-on {
+  opacity: 1;
 }

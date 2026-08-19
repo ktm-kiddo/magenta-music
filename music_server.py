@@ -11,7 +11,9 @@ Endpoints:
     GET  /stream.mp3   the endless stream; one connection per listener
     GET  /status       JSON: current prompt, listener count, tuning knobs
     POST /prompt       JSON {"text": ..., "raw": false} -> steers the music,
-                       plus any of morph/temp/topk/cfg/llm to retune it
+                       plus any of morph/temp/topk/cfg/llm to retune it, and
+                       `guidance` to replace the GM's standing direction for
+                       the prompt rewriter
 
 Everything is CORS-open because the Foundry page is served from a different
 origin (and usually a different port) than this server.
@@ -142,7 +144,10 @@ setInterval(async()=>{
 # Knobs a client may set through POST /prompt, alongside (or instead of) a
 # prompt. The player validates the values; the server only decides what is
 # spellable, so that a typo in a client cannot silently set something else.
-_TUNING_KEYS = ('morph', 'temp', 'topk', 'cfg', 'llm')
+# `guidance` is not a knob but travels the same way: the module resends it with
+# every prompt so that restarting this process cannot leave the table on a
+# direction nobody wrote any more.
+_TUNING_KEYS = ('morph', 'temp', 'topk', 'cfg', 'llm', 'guidance')
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):

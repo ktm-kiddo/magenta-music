@@ -23,8 +23,10 @@ the 10–15 GB upload happens on a datacenter connection instead of yours.
 Actions tab → **template image** → **Run workflow**, choosing the model and tag.
 Or push a tag: `git tag image-v1 && git push origin image-v1`.
 
-Then make the package public under the repo's Packages tab — a Vast instance
-cannot pull a private image without registry credentials.
+It lands at `ghcr.io/<owner>/<repo>:<tag>` — for this repo,
+`ghcr.io/ktm-kiddo/magenta-music:latest`. Then make the package public under the
+repo's Packages tab: a Vast instance cannot pull a private image without
+registry credentials.
 
 ## Build it locally
 
@@ -61,7 +63,7 @@ Create a template with:
 
 | Field | Value |
 |---|---|
-| Image | `youruser/magenta-music:latest` |
+| Image | `ghcr.io/ktm-kiddo/magenta-music:latest`, or your own tag if you built it |
 | Launch mode | SSH (`openssh-server` is in the image; Vast injects the key) |
 | On-start | `magenta-bootstrap` |
 | Disk | 40 GB — the image counts against it |
@@ -85,14 +87,26 @@ is a published token.
 | `MUSIC_REPO` | this repo | Point it at a fork |
 | `MUSIC_PREROLL` | `6` | Seconds buffered before playback starts |
 | `MUSIC_TARGET_BUFFER` | `4` | Buffer depth; also bounds prompt latency |
+| `MUSIC_ROOT` | `/workspace/magenta-music` | Where the repo is cloned |
+| `MUSIC_VENV` | `/opt/venv` | The baked venv, symlinked in as the repo's `.venv` |
+| `MAGENTA_HOME` | `/opt/magenta` | Where the baked weights live; `mrt` must agree |
+
+The paths in the second group are what the image was built with, and changing
+one means the boot script looks somewhere the weights or the venv are not — set
+them only if you have moved those yourself.
 
 Whichever of these are set get written to `/workspace/magenta.env` (mode 600)
 and sourced by new shells, so starting the player by hand picks up the same
 fixed address and token rather than silently falling back to a quick tunnel.
 
 With `MUSIC_AUTOSTART=1` the instance comes up already streaming, and the URL
-and token are written to `/workspace/music-session.txt`. Attach to the console
-with `tmux attach -t music`.
+and token are written to `/workspace/music-session.txt` (`SESSION_FILE`). Attach
+to the console with `tmux attach -t music`. The player is started as
+`./start.sh --backend jax --model $MUSIC_MODEL`, so the console behaves exactly
+as it does on a Mac.
+
+Without autostart, boot stops after the setup and prints the two commands that
+start a session — a `tmux new -s music`, then `./start.sh`.
 
 Autostart is only fully hands-off with a fixed address — `CF_TUNNEL_TOKEN` plus
 `MUSIC_HOSTNAME`, or a Tailscale Funnel hostname. With a quick tunnel the
