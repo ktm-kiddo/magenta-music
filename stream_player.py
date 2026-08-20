@@ -181,6 +181,7 @@ class StreamingPlayer:
     self.enhancer = (None if (key is None or args.no_llm) else
                      prompt_enhancer.PromptEnhancer(
                          key, model=args.llm_model, timeout=args.llm_timeout,
+                         endpoint=args.llm_endpoint,
                          max_tokens=args.llm_max_tokens,
                          reasoning_effort=args.llm_effort,
                          guidance=self.guidance))
@@ -466,6 +467,8 @@ class StreamingPlayer:
     if self.use_llm:
       print(f'Describe what is happening and {self.enhancer.model} turns it '
             'into a style prompt (/raw to bypass, /llm off to disable).')
+      if self.args.llm_endpoint != prompt_enhancer.DEFAULT_ENDPOINT:
+        print(f'Rewriter endpoint: {self.args.llm_endpoint}')
       if self.guidance:
         print(f'Standing direction: {self.guidance}')
     elif not self.args.no_llm:
@@ -595,16 +598,27 @@ def main() -> None:
   p.add_argument('--no-llm', action='store_true',
                  help='send typed text straight to the music model without '
                       'rewriting it into a style prompt')
-  p.add_argument('--llm-model', default=prompt_enhancer.DEFAULT_MODEL,
-                 help='model used to rewrite prompts')
+  p.add_argument('--llm-model', default=None,
+                 help='model used to rewrite prompts (default: LLM_MODEL from '
+                      'the environment or .env, otherwise '
+                      f'{prompt_enhancer.DEFAULT_MODEL})')
+  p.add_argument('--llm-endpoint', default=None,
+                 help='OpenAI-compatible chat-completions URL (default: '
+                      'LLM_ENDPOINT from the environment or .env, otherwise '
+                      'Groq). Change it with the model when switching '
+                      'provider -- a Cerebras model on Groq\'s URL is a 401.')
   p.add_argument('--llm-timeout', type=float, default=5.0)
   p.add_argument('--llm-max-tokens', type=int,
                  default=prompt_enhancer.DEFAULT_MAX_TOKENS,
                  help='output budget; reasoning models need room to think '
                       'before they answer')
-  p.add_argument('--llm-effort', default='low',
-                 choices=['low', 'medium', 'high'],
-                 help='reasoning effort, for models that support it')
+  p.add_argument('--llm-effort', default=None,
+                 help='reasoning effort, for models that support it, passed '
+                      'through as typed because providers disagree on the '
+                      'words (gpt-oss takes low/medium/high, qwen3 takes '
+                      'none/default). "off" sends no such field at all. '
+                      f'Default: LLM_EFFORT from the environment or .env, '
+                      f'otherwise {prompt_enhancer.DEFAULT_EFFORT}.')
   p.add_argument('--guidance', default=None,
                  help='standing direction added to the rewriter\'s system '
                       'prompt, e.g. "keep the music ambient, never '
@@ -642,6 +656,13 @@ def main() -> None:
   # and therefore reacts to prompts much sooner.
   # A prompt the user typed may be a scene rather than a style, so it goes
   # through the rewriter; the built-in default is already a style.
+  # Flag beats environment beats .env beats the built-in default, the same
+  # order find_api_key uses -- so one machine can be pinned to a different
+  # model in .env without every command line having to say so.
+  args.llm_model = prompt_enhancer.find_model(args.llm_model)
+  args.llm_endpoint = prompt_enhancer.find_endpoint(args.llm_endpoint)
+  args.llm_effort = prompt_enhancer.find_effort(args.llm_effort)
+
   args.enhance_initial = args.prompt is not None
   if args.prompt is None:
     args.prompt = DEFAULT_PROMPT

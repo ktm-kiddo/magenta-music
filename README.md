@@ -213,6 +213,8 @@ Pressing Enter on an empty line does nothing — the music just keeps going.
 | `--backend jax` | Run on an NVIDIA GPU instead of Apple Silicon ([details](#running-the-model-on-a-remote-gpu)) |
 | `--serve-bitrate 96` | Lower MP3 bitrate if your upstream is tight |
 | `--no-llm` | Send your text straight to the music model, no rewriting |
+| `--llm-model ...` | Which model rewrites prompts (or `LLM_MODEL` in `.env`) |
+| `--llm-endpoint ...` | Where that model lives (or `LLM_ENDPOINT`) |
 | `--guidance "..."` | Opening standing direction for the rewriter (see below) |
 | `--list-devices` | List audio outputs, for `--device` |
 | `--no-record` | Don't hold generated audio in memory (disables `/save`) |
@@ -247,9 +249,10 @@ embeds poorly. So typed text goes through a small, fast LLM first, which turns
 it into "slow ominous dungeon drone, low strings, dark ambient, sparse
 percussion".
 
-It talks to any OpenAI-compatible chat endpoint. Currently pointed at Groq
+It talks to any OpenAI-compatible chat endpoint. It defaults to Groq
 (`openai/gpt-oss-20b`); Cerebras also works. Both are fast enough (well under a
-second) to sit in a live loop.
+second) to sit in a live loop. Which model, and where, is
+[configuration rather than an edit](#choosing-the-rewriter-model).
 
 Everything degrades gracefully: no key, a network error, or a rate limit all
 fall back to sending your text to the music model unchanged. You'll see a
@@ -286,6 +289,37 @@ process cannot leave the table on a direction nobody wrote any more, and
 Foundry. Set it here for a solo session at the console; set it there for a
 table.
 
+### Choosing the rewriter model
+
+`LLM_MODEL` and `LLM_ENDPOINT`, in the environment or in `.env` beside the key:
+
+```bash
+LLM_MODEL=openai/gpt-oss-120b
+# switching provider means switching both
+# LLM_ENDPOINT=https://api.cerebras.ai/v1/chat/completions
+```
+
+Resolution is the same order as the key: `--llm-model` → environment → `.env` →
+the built-in default. So a slower box can be pinned to a smaller model in its
+own `.env` without every command line having to say so, and
+`LLM_MODEL=... ./start.sh` still overrides for one run.
+
+`LLM_EFFORT` goes with them, because providers disagree about reasoning effort:
+`gpt-oss` wants `low`/`medium`/`high`, `qwen3` rejects those and wants
+`none`/`default`. The value is passed through as typed, and `off` sends no such
+field at all — which nothing can refuse, and is the escape hatch when a new
+model returns `400` on the parameter.
+
+Two things to expect when you swap models:
+
+- **Reasoning models need output budget.** They spend it in a `<think>` block
+  and only then answer; run out and you get no style at all. The failure is
+  reported in plain words ("spent all 1000 tokens reasoning without answering")
+  rather than becoming music — raise `--llm-max-tokens` or lower `LLM_EFFORT`.
+- **Bigger is not obviously better.** This is a one-line formatting task with
+  four worked examples. `gpt-oss-120b` answers it about as well as `20b` and
+  takes longer, and latency is felt directly at the table.
+
 ### Setting the API key
 
 Copy `.env.example` to `.env` and put your key in it:
@@ -302,8 +336,9 @@ live credential one `git add .` away from being committed.
 Resolution order is: `--api-key` flag → `API_KEY` constant → `GROQ_API_KEY` or
 `CEREBRAS_API_KEY` in the environment → the same two names in `.env`.
 
-If you use a Cerebras key you must also change `DEFAULT_ENDPOINT` in
-`prompt_enhancer.py` — a Cerebras key sent to Groq's endpoint just returns 401.
+A Cerebras key sent to Groq's endpoint just returns 401, so set
+`LLM_ENDPOINT` (and `LLM_MODEL`) alongside it — see
+[Choosing the rewriter model](#choosing-the-rewriter-model).
 
 ---
 

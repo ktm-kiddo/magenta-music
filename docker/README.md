@@ -83,7 +83,10 @@ is a published token.
 | `CF_TUNNEL_TOKEN` | — | Named-tunnel token; fixes the hostname too |
 | `MUSIC_HOSTNAME` | — | The hostname routed to `localhost:30001`, e.g. `music.example.com` |
 | `GROQ_API_KEY` | — | Written to `.env` at boot; removes the last manual step |
-| `MUSIC_MODEL` | `mrt2_small` | Must be a model baked into the image |
+| `LLM_MODEL` | `openai/gpt-oss-20b` | Which model rewrites scene text into a style. Written to `.env` like the key, so it survives into an SSH session |
+| `LLM_ENDPOINT` | Groq | Where that model lives; set it with `LLM_MODEL` when switching provider |
+| `LLM_EFFORT` | `low` | Reasoning effort, as the provider spells it; `off` sends none |
+| `MUSIC_MODEL` | `mrt2_small` | The **music** model, not the rewriter. Must be one baked into the image |
 | `MUSIC_REPO` | this repo | Point it at a fork |
 | `MUSIC_PREROLL` | `6` | Seconds buffered before playback starts |
 | `MUSIC_TARGET_BUFFER` | `4` | Buffer depth; also bounds prompt latency |

@@ -81,22 +81,30 @@ if [[ -n "${MUSIC_TOKEN:-}${CF_TUNNEL_TOKEN:-}${MUSIC_HOSTNAME:-}" ]]; then
   fi
 fi
 
-# --- Groq key --------------------------------------------------------------
+# --- Rewriter settings -----------------------------------------------------
 # .env is gitignored, so it never arrives with the clone -- which on a fresh
-# instance means the one remaining manual step. Taking the key from the template
+# instance means the one remaining manual step. Taking these from the template
 # environment removes it. prompt_enhancer checks the environment before it
-# checks .env, so the file is belt and braces: it is what makes the key survive
+# checks .env, so the file is belt and braces: it is what makes them survive
 # into a shell or tmux session that did not inherit the template's variables.
-if [[ -n "${GROQ_API_KEY:-}" ]]; then
+#
+# LLM_MODEL is here for the same reason the token is: a box pinned to a
+# different rewriter model would otherwise fall back to the default the moment
+# you started the player over SSH instead of from the on-start hook, and the
+# only symptom would be the music being steered by a model you did not choose.
+for name in GROQ_API_KEY CEREBRAS_API_KEY LLM_MODEL LLM_ENDPOINT LLM_EFFORT; do
+  value="${!name:-}"
+  [[ -n "$value" ]] || continue
   if [[ ! -f "$MUSIC_ROOT/.env" ]]; then
-    say "writing Groq key to $MUSIC_ROOT/.env"
+    # Created empty and root-only before anything is written into it: this
+    # file holds the API key.
     install -m 600 /dev/null "$MUSIC_ROOT/.env"
-    echo "GROQ_API_KEY=$GROQ_API_KEY" >> "$MUSIC_ROOT/.env"
-  elif ! grep -q '^GROQ_API_KEY=' "$MUSIC_ROOT/.env"; then
-    say "adding Groq key to the existing $MUSIC_ROOT/.env"
-    echo "GROQ_API_KEY=$GROQ_API_KEY" >> "$MUSIC_ROOT/.env"
+  elif grep -q "^$name=" "$MUSIC_ROOT/.env"; then
+    continue  # already set in the file; leave what is there alone
   fi
-fi
+  say "writing $name to $MUSIC_ROOT/.env"
+  echo "$name=$value" >> "$MUSIC_ROOT/.env"
+done
 
 # --- Optional autostart ----------------------------------------------------
 # Off by default: a box that starts streaming the moment it boots is only

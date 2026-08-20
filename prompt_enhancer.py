@@ -7,8 +7,10 @@ style, and embeds poorly. This module runs the line through a small LLM to get
 
 Talks to any OpenAI-compatible chat endpoint; Groq and Cerebras both work and
 are fast enough (well under a second for a line this short) to sit in an
-interactive loop. Set DEFAULT_ENDPOINT and DEFAULT_MODEL below; put the key in
-.env next to this file (`GROQ_API_KEY=...`) or pass --api-key. The key is
+interactive loop. The model, the endpoint and the key all come from .env next
+to this file (`LLM_MODEL=`, `LLM_ENDPOINT=`, `GROQ_API_KEY=`) or from the
+environment, so switching provider is a config change rather than an edit here;
+--llm-model / --llm-endpoint / --api-key override for one run. The key is
 deliberately not a constant in this file so it cannot be committed by accident.
 
 The table can bend the rewriter without touching this file: `guidance` is free
@@ -23,14 +25,29 @@ import re
 import requests
 
 DEFAULT_ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions'
-DEFAULT_MODEL = 'openai/gpt-oss-20b'  # --llm-model to change
+DEFAULT_MODEL = 'openai/gpt-oss-20b'
 API_KEY = ''  # leave blank; the key belongs in .env, which is not committed
+
+# Both are overridable without editing this file: --llm-model / --llm-endpoint,
+# or these names in the environment or .env. The model and the endpoint are a
+# pair -- a Cerebras model name sent to Groq's URL is a 401 -- so they are
+# settable the same way rather than one in a flag and one in the source.
+_MODEL_VARS = ('LLM_MODEL', 'MUSIC_LLM_MODEL')
+_ENDPOINT_VARS = ('LLM_ENDPOINT', 'MUSIC_LLM_ENDPOINT')
+_EFFORT_VARS = ('LLM_EFFORT', 'MUSIC_LLM_EFFORT')
+
+# Accepted values for reasoning_effort are the provider's business, not ours:
+# gpt-oss wants low/medium/high, qwen3.6 rejects those and wants none/default.
+# So the value is passed through as typed, and these words mean "send no
+# reasoning_effort field at all" -- the only setting no provider can refuse.
+_EFFORT_OFF = ('off', 'omit', 'unset', '')
 
 # Reasoning models spend most of their output budget on a `reasoning` field and
 # only then emit `content`, so they need generous max_tokens or they hit
 # finish_reason=length with no answer at all. `reasoning_effort: low` keeps that
 # short (~14 vs ~284 reasoning tokens) and the round trip near 0.4s.
 DEFAULT_MAX_TOKENS = 1000
+DEFAULT_EFFORT = 'low'  # what gpt-oss wants; LLM_EFFORT for anything else
 _REASONING_MODELS = re.compile(r'gpt-oss|qwen-?3|deepseek-r1|glm', re.IGNORECASE)
 
 # Upper bound on descriptors kept from a reply, matching the 4-8 the system
@@ -113,36 +130,87 @@ _EXAMPLES = [
 ]
 
 
-def find_api_key(explicit: str | None = None,
-                 env_file: pathlib.Path | None = None) -> str | None:
-  """Key from the flag, the API_KEY constant, the environment, or a .env file.
+def _env_value(names: tuple[str, ...],
+               env_file: pathlib.Path | None = None) -> str | None:
+  """First non-empty value for `names`, from the environment then a .env file.
+
+  The environment wins so that a one-off `LLM_MODEL=... ./start.sh` overrides
+  the file, which is the order start.sh uses when it reads .env itself.
 
   `env_file` exists so tests can point at a throwaway path instead of the real
   .env -- a test that writes to the default location will destroy a real key.
   """
+  for name in names:
+    if os.environ.get(name):
+      return os.environ[name]
+  env_file = env_file or pathlib.Path(__file__).parent / '.env'
+  if not env_file.exists():
+    return None
+  # Parsed into a dict first, then looked up in preference order: reading in
+  # file order would let `GROQ_API_KEY=` (present but blank, as .env.example
+  # ships it) shadow a CEREBRAS_API_KEY filled in below it.
+  values = {}
+  for line in env_file.read_text().splitlines():
+    line = line.strip().removeprefix('export ').strip()
+    if not line or line.startswith('#'):
+      continue
+    key, separator, value = line.partition('=')
+    if separator:
+      values[key.strip()] = value.strip().strip('"').strip("'")
+  for name in names:
+    if values.get(name):
+      return values[name]
+  return None
+
+
+def find_api_key(explicit: str | None = None,
+                 env_file: pathlib.Path | None = None) -> str | None:
+  """Key from the flag, the API_KEY constant, the environment, or a .env file."""
   if explicit:
     return explicit
   if API_KEY:
     return API_KEY
-  for name in ('GROQ_API_KEY', 'CEREBRAS_API_KEY'):
-    if os.environ.get(name):
-      return os.environ[name]
-  env_file = env_file or pathlib.Path(__file__).parent / '.env'
-  if env_file.exists():
-    for line in env_file.read_text().splitlines():
-      line = line.strip()
-      if line.startswith(('GROQ_API_KEY', 'CEREBRAS_API_KEY')):
-        _, _, value = line.partition('=')
-        return value.strip().strip('"').strip("'") or None
-  return None
+  return _env_value(('GROQ_API_KEY', 'CEREBRAS_API_KEY'), env_file)
+
+
+def find_model(explicit: str | None = None,
+               env_file: pathlib.Path | None = None) -> str:
+  """Rewriter model from the flag, the environment, .env, or the default."""
+  return explicit or _env_value(_MODEL_VARS, env_file) or DEFAULT_MODEL
+
+
+def find_endpoint(explicit: str | None = None,
+                  env_file: pathlib.Path | None = None) -> str:
+  """Chat-completions URL from the flag, the environment, .env, or the default."""
+  return explicit or _env_value(_ENDPOINT_VARS, env_file) or DEFAULT_ENDPOINT
+
+
+def find_effort(explicit: str | None = None,
+                env_file: pathlib.Path | None = None) -> str | None:
+  """Reasoning effort to send, or None to send none.
+
+  Returns None for the _EFFORT_OFF words so that pinning an awkward model in
+  .env is a config change too: a model that rejects `low` must be escapable
+  without reaching for a command-line flag, or LLM_MODEL alone is not enough
+  to switch to it.
+  """
+  value = explicit or _env_value(_EFFORT_VARS, env_file) or DEFAULT_EFFORT
+  return None if value.strip().lower() in _EFFORT_OFF else value.strip()
 
 
 def _clean(text: str) -> str:
   """Strip reasoning blocks, quotes, and stray prose from the model output."""
   text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
-  # Reasoning models sometimes leave an unterminated block; keep the tail.
   if '</think>' in text:
     text = text.split('</think>')[-1]
+  # An unterminated <think> is a model that ran out of budget mid-thought and
+  # never reached its answer. There is no tail to keep, and the last line of
+  # the reasoning is emphatically not a style -- qwen3.6 ends one on
+  # '- Wait, "dark ambient" is 2 words', which would go straight to the music
+  # model. Returning nothing makes the caller report it and pass the original
+  # text through instead.
+  if '<think>' in text.lower():
+    return ''
   lines = [ln.strip() for ln in text.strip().splitlines() if ln.strip()]
   if not lines:
     return ''
@@ -249,5 +317,10 @@ class PromptEnhancer:
 
     cleaned = _clean(content)
     if not cleaned:
+      # Same cause as the no-content case above, but this model spent the
+      # budget inside `content` rather than a separate `reasoning` field.
+      if choice.get('finish_reason') == 'length':
+        return text, (f'spent all {self.max_tokens} tokens reasoning without '
+                      'answering; raise --llm-max-tokens or lower --llm-effort')
       return text, 'model returned an empty style'
     return cleaned, None
